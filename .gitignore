@@ -218,3 +218,92 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# careflow_app
+careflow_app/out/
+careflow_app/.env
+
+# Secrets and credentials (the .env.example templates stay tracked)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+credentials*.json
+service-account*.json
+secrets.*
+*.secret
+.netrc
+
+# Virtual environments, any name or depth
+.venv*/
+**/.venv/
+
+# Local databases, checkpoints and vector stores (M3 to M7 will create these)
+*.db
+*.sqlite
+*.sqlite3
+qdrant_storage/
+qdrant_data/
+local_qdrant/
+checkpoints/
+*.ckpt
+
+# Logs, run output and scratch files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+scratch/
+tmp/
+temp/
+.tmp/
+
+# Test, type-check and lint caches
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor and IDE state
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.code-workspace
+
+# Claude Code local state (personal permissions, plans, worktrees)
+.claude/settings.local.json
+.claude/worktrees/
+.claude/plans/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# Archives and editor-generated docs that should not be committed by accident
+*.zip
+*.tar
+*.tar.gz
+*.7z
+~$*
+*.pyc
+
+# Node (if a frontend or MCP tooling is added later)
+node_modules/
+npm-debug.log*
+
+# Langfuse / tracing local exports (M7)
+langfuse_exports/
+traces/
