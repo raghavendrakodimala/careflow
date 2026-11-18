@@ -70,6 +70,9 @@ def score(records: list[dict], cache: dict[str, dict]) -> None:
         if not all(checks[k] for k in ("urgency", "specialty", "seeks_clinical_advice")):
             mismatches.append((rec["record_id"], gt, p))
 
+    if not tally:
+        print("\nNothing scored (no successful predictions); out/m1_mismatches.json left unchanged.")
+        return
     print("\nPer-field accuracy (records with ground_truth)")
     for name, (ok, n) in tally.items():
         print(f"  {name:<44}{ok:>4}/{n:<4} {ok / n:6.1%}" if n else f"  {name}: n/a")
@@ -98,6 +101,9 @@ def main() -> None:
     records = load_records()[: args.limit]
     cache = load_cache()
     settings = get_settings()
+    if args.score_only and not any("parsed" in cache.get(r["record_id"], {}) for r in records):
+        # Never overwrite the last mismatches file with an empty one because the cache is missing.
+        raise SystemExit(f"--score-only: no cached predictions in {CACHE}. Run without --score-only first.")
     if not args.score_only:
         print(f"model order: {settings.models}")
         todo = [r for r in records if r["record_id"] not in cache or "error" in cache[r["record_id"]]]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
@@ -10,6 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLKIT_DIR = REPO_ROOT / "capstone-data-toolkit"
 DATA_DIR = TOOLKIT_DIR / "data" / "careflow"
+# Runtime SQLite database (bookings, flags), seeded from DATA_DIR's CSVs. Gitignored via out/.
+# The seeded DATA_DIR is never written.
+RUNTIME_DB = Path(os.environ.get("CAREFLOW_RUNTIME_DB") or REPO_ROOT / "careflow_app" / "out" / "runtime.db")
 
 
 class Settings(BaseSettings):
