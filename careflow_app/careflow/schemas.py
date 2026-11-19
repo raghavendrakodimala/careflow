@@ -51,10 +51,14 @@ class PatientRequest(BaseModel):
 
     @property
     def insurance_id(self) -> str | None:
-        """Plan and member number in the form the patients table stores them."""
+        """Plan and member number, or the member number alone when no plan was stated.
+
+        The member number is what identifies the patient (check_eligibility accepts either form), so a
+        missing plan name must not hide it; that also keeps this in line with missing_fields.
+        """
         if self.insurance_plan and self.insurance_member_number:
             return f"{self.insurance_plan} {self.insurance_member_number}"
-        return None
+        return self.insurance_member_number
 
     @field_validator("insurance_plan", mode="before")
     @classmethod

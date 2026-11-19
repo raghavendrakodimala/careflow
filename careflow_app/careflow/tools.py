@@ -1,0 +1,393 @@
+"""M2 tools: mock EHR appointments, insurance eligibility, pre-authorisation, co-pay calculator, flag for human.
+
+This module is the thin tool layer. It validates and normalises inputs, looks records up, and shapes the
+replies the model reads. The clinic rules live in domain/policies.py, state lives in the transactional
+RuntimeStore (SQLite), the tool contracts live in tool_contracts.py, and time comes from an injected Clock.
+
+Every public method returns a plain dict and never raises on bad input: the agent needs to read the
+failure, not crash on it. IDs and codes are matched case-insensitively.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from .domain import policies
+from .domain.clock import Clock, FrozenClock
+from .store import RuntimeStore, SlotUnavailable
+from .tool_contracts import TOOL_SPECS, TOOLS_BY_NAME
+
+__all__ = ["CareFlowTools", "TOOL_SPECS", "URGENCIES"]
+
+URGENCIES = ("Routine", "Priority", "Urgent", "Emergent")
+_MEMBER_TAIL = re.compile(r"[A-Z]{3}\d{6,10}$")
+
+
+def _id(value) -> str:
+    """Canonical form of an ID or code: the tables store them upper-case (MHP-P-00001, GAST-COLO)."""
+    return str(value or "").strip().upper()
+
+
+class CareFlowTools:
+    def __init__(
+        self,
+        data_dir: Path | str | None = None,
+        store: RuntimeStore | None = None,
+        clock: Clock | None = None,
+    ):
+        """No store: a private in-memory database seeded from `data_dir` (tests, one-off runs).
+        With a store: its database, e.g. RuntimeStore() for out/runtime.db shared across restarts and processes."""
+        self.store = store or RuntimeStore(":memory:", seed_dir=data_dir)
+        self.clock = clock or FrozenClock()
+        rows = self.store.rows
+        # Reference data, read once. Slots, appointments and flags change, so they are always read live.
+        self.patients = {r["patient_ref"]: r for r in rows("patients")}
+        self._by_member = {r["member_number"]: r for r in self.patients.values()}
+        self.plans = {r["plan_code"]: r for r in rows("plans")}
+        self.procedures = {r["procedure_code"]: r for r in rows("procedures")}
+        self.copays = {(r["plan_code"], r["service_category"]): r["copay_usd"] for r in rows("plan_copays")}
+        self.preauth = {(r["procedure_code"], r["plan_code"]): r for r in rows("preauth_rules")}
+        self.providers = {r["provider_id"]: r for r in rows("providers")}
+        self.sites = {r["site_id"]: r for r in rows("sites")}
+        self.specialties = {r["specialty"] for r in rows("specialties")}
+        self._specialty_by_lower = {s.lower(): s for s in self.specialties}
+
+    # ---- live state (always from the store) -----------------------------------------------------
+    # Referrals are read live too: M5 workflow nodes and the M6 MCP server will create and update them.
+    @property
+    def referrals(self) -> dict[str, dict]:
+        return {r["referral_id"]: r for r in self.store.rows("referrals")}
+
+    @property
+    def referral_details(self) -> dict[str, dict]:
+        return {r["referral_id"]: r for r in self.store.rows("referral_details")}
+
+    @property
+    def slots(self) -> dict[str, dict]:
+        return {r["slot_id"]: r for r in self.store.rows("appointment_slots")}
+
+    @property
+    def booked(self) -> dict[str, str]:
+        """slot_id -> patient_ref for bookings made through the tools."""
+        return {r["slot_id"]: r["patient_ref"] for r in self.store.rows("appointments") if r["slot_id"]}
+
+    @property
+    def flags(self) -> list[dict]:
+        return self.store.flags()
+
+    @property
+    def established(self) -> set[str]:
+        return policies.established_patients(self.store.rows("appointments"), self.clock.now())
+
+    # ---- helpers -------------------------------------------------------------
+    @staticmethod
+    def _err(message: str, **extra) -> dict:
+        return {"ok": False, "error": message, **extra}
+
+    def _now_text(self) -> str:
+        return self.clock.now().isoformat(timespec="minutes")
+
+    def _patient(self, patient_ref: str | None, member_number: str | None):
+        if patient_ref:
+            return self.patients.get(_id(patient_ref))
+        if member_number:
+            cleaned = re.sub(r"[\s\-]+", "", str(member_number)).upper()
+            # Accept the combined "MERIDIAN-SILVER MER64867187" form PatientRequest.insurance_id gives.
+            m = _MEMBER_TAIL.search(cleaned)
+            return self._by_member.get(m.group(0) if m else cleaned)
+        return None
+
+    def is_new_patient(self, patient_ref: str) -> bool:
+        return _id(patient_ref) not in self.established
+
+    def _visit_price(self, specialty: str) -> int | None:
+        proc = policies.visit_procedure(self.procedures.values(), specialty)
+        return policies.self_pay_price(proc) if proc else None
+
+    # ---- 1. insurance eligibility -------------------------------------------
+    def check_eligibility(self, patient_ref: str | None = None, member_number: str | None = None) -> dict:
+        """Plan and eligibility status. Names and birth dates are deliberately not returned."""
+        if not (patient_ref or member_number):
+            return self._err("give patient_ref or member_number")
+        p = self._patient(patient_ref, member_number)
+        if p is None:
+            return self._err("no matching patient on record", found=False)
+        plan = self.plans[p["plan_code"]]
+        status = p["eligibility_status"]
+        notes = {
+            "active": "Coverage is active.",
+            "pending_verification": "Coverage is awaiting verification. Appointments can be booked and staff will "
+            "verify cover before the visit. Do not quote insurance costs until verified; self-pay is also available.",
+            "lapsed": "Coverage has lapsed. Do not quote insurance benefits. Offer self-pay at the list price "
+            "(payment due at check-in, no deposit) and staff help with coverage.",
+        }
+        return {
+            "ok": True,
+            "found": True,
+            "patient_ref": p["patient_ref"],
+            "plan_code": p["plan_code"],
+            "plan_name": plan["plan_name"],
+            "eligibility_status": status,
+            "eligible": policies.insurance_quote_allowed(status),
+            "annual_deductible_usd": plan["annual_deductible_usd"],
+            "deductible_met_usd": p["deductible_met_usd"],
+            "new_patient": self.is_new_patient(p["patient_ref"]),
+            "note": notes.get(status, "Unknown status; refer to staff."),
+        }
+
+    # ---- 2. mock EHR appointment API ----------------------------------------
+    def find_appointment_slots(
+        self,
+        specialty: str,
+        mode: str | None = None,
+        earliest_date: str | None = None,
+        limit: int = 5,
+        patient_ref: str | None = None,
+        new_patient: bool | None = None,
+    ) -> dict:
+        """Open slots, soonest first. For a new patient (given, or inferred from patient_ref), slots with
+        providers who are not accepting new patients are left out."""
+        canonical = self._specialty_by_lower.get(str(specialty or "").strip().lower())
+        if canonical is None:
+            return self._err(f"unknown specialty {specialty!r}", valid_specialties=sorted(self.specialties))
+        if mode not in (None, "in_person", "telehealth"):
+            return self._err("mode must be 'in_person' or 'telehealth'")
+        now = self.clock.now()
+        try:
+            floor = datetime.fromisoformat(earliest_date) if earliest_date else now
+        except ValueError:
+            return self._err("earliest_date must be ISO, e.g. 2026-08-05")
+        if floor.tzinfo is not None:  # slot times are naive; compare like with like
+            floor = floor.astimezone(timezone.utc).replace(tzinfo=None)
+        floor = max(floor, now)
+        if new_patient is None and patient_ref:
+            new_patient = self.is_new_patient(patient_ref)
+        out = []
+        for s in sorted(self.slots.values(), key=lambda r: r["starts_at"]):
+            if s["specialty"] != canonical or s["status"] != "open":
+                continue
+            if mode and s["mode"] != mode:
+                continue
+            if datetime.fromisoformat(s["starts_at"]) < floor:
+                continue
+            prov, site = self.providers[s["provider_id"]], self.sites[s["site_id"]]
+            if not policies.may_book_with(prov, bool(new_patient)):
+                continue
+            out.append(
+                {
+                    "slot_id": s["slot_id"],
+                    "starts_at": s["starts_at"],
+                    "duration_minutes": s["duration_minutes"],
+                    "mode": s["mode"],
+                    "provider": prov["name"],
+                    "accepts_new_patients": prov["accepts_new_patients"],
+                    "site": site["site_name"],
+                    "city": site["city"],
+                }
+            )
+            if len(out) >= max(1, min(int(limit), 20)):
+                break
+        return {"ok": True, "specialty": canonical, "count": len(out), "slots": out}
+
+    def book_appointment(
+        self, patient_ref: str, slot_id: str, new_patient: bool | None = None, self_pay: bool = False
+    ) -> dict:
+        """Book a slot. How it is paid follows policies.booking_payment (owner rule, 2026-11-18). The slot
+        update, the appointment row and any staff flag are written in one transaction."""
+        p = self.patients.get(_id(patient_ref))
+        if p is None:
+            return self._err(
+                "no matching patient on record; staff must register the patient (self-pay is available)", found=False
+            )
+        slot_id = _id(slot_id)
+        slot = self.store.one("appointment_slots", "slot_id", slot_id)
+        if slot is None:
+            return self._err(f"unknown slot {slot_id!r}")
+        if slot["status"] != "open":
+            return self._err("that slot is no longer available", slot_id=slot_id)
+        status = p["eligibility_status"]
+        price = self._visit_price(slot["specialty"])
+        decision = policies.booking_payment(status, self_pay, slot_id)
+        if not decision.bookable:
+            return self._err(
+                f"coverage is {status}, so this cannot be booked on insurance. Offer self-pay and book with "
+                "self_pay=true only after the patient agrees.",
+                eligibility_status=status,
+                self_pay_available=True,
+                self_pay_usd=price,
+                payment_terms=policies.SELF_PAY_TERMS,
+            )
+        prov = self.providers[slot["provider_id"]]
+        is_new = self.is_new_patient(p["patient_ref"]) if new_patient is None else new_patient
+        if not policies.may_book_with(prov, is_new):
+            return self._err(
+                "this provider is not accepting new patients; choose another slot",
+                slot_id=slot_id,
+                hint="call find_appointment_slots with patient_ref to see only suitable slots",
+            )
+        flag = None
+        if decision.staff_reason:
+            flag = {"patient_ref": p["patient_ref"], "reason": decision.staff_reason, "urgency": "Routine",
+                    "created_at": self._now_text()}
+        try:
+            appointment, flag_row = self.store.book(slot_id, p["patient_ref"], decision.payment, flag)
+        except SlotUnavailable:  # someone else took it between our read and the write
+            return self._err("that slot is no longer available", slot_id=slot_id)
+        extra: dict = {}
+        if decision.payment == "self_pay":
+            extra = {"self_pay_usd": price, "payment_terms": policies.SELF_PAY_TERMS}
+        elif decision.payment == "insurance_pending_verification":
+            extra = {"note": "Booked. Coverage is awaiting verification; staff will confirm it before the visit."}
+        if flag_row:
+            extra["flag_id"] = flag_row["flag_id"]
+        return {
+            "ok": True,
+            "appointment_id": appointment["appointment_id"],
+            "slot_id": slot_id,
+            "patient_ref": p["patient_ref"],
+            "starts_at": slot["starts_at"],
+            "mode": slot["mode"],
+            "provider": prov["name"],
+            "site": self.sites[slot["site_id"]]["site_name"],
+            "payment": decision.payment,
+            **extra,
+        }
+
+    # ---- 3. pre-authorisation check -----------------------------------------
+    def check_preauth(
+        self,
+        procedure_code: str | None = None,
+        plan_code: str | None = None,
+        patient_ref: str | None = None,
+        referral_id: str | None = None,
+    ) -> dict:
+        """Is the procedure covered under the plan, does it need pre-authorisation, and how long does
+        approval take. The plan comes from plan_code, else the patient's plan, else the referral's patient
+        (referrals -> patient_ref -> plan; referral_details has no patient or plan column)."""
+        referral = None
+        if referral_id:
+            rid = _id(referral_id)
+            details = self.store.one("referral_details", "referral_id", rid)
+            ref_row = self.store.one("referrals", "referral_id", rid)
+            if details is None or ref_row is None:
+                return self._err(f"unknown referral {rid!r}")
+            procedure_code = procedure_code or details["procedure_code"]
+            patient_ref = patient_ref or ref_row["patient_ref"]
+            referral = {
+                "referral_id": rid,
+                "referral_status": ref_row["status"],
+                "to_specialty": ref_row["to_specialty"],
+                "preauth_status": details["preauth_status"],
+                "sla_due_on": details["sla_due_on"],
+            }
+        code = _id(procedure_code)
+        if not code:
+            return self._err("give procedure_code or referral_id")
+        if code not in self.procedures:
+            return self._err(f"unknown procedure {code!r}", valid_codes=sorted(self.procedures))
+        plan = _id(plan_code) or None
+        if plan is None and patient_ref:
+            p = self.patients.get(_id(patient_ref))
+            if p is None:
+                return self._err("no matching patient on record", found=False)
+            plan = p["plan_code"]
+        if plan is None:
+            return self._err("give plan_code, patient_ref or referral_id")
+        if plan not in self.plans:
+            return self._err(f"unknown plan {plan!r}", valid_plans=sorted(self.plans))
+        rule = self.preauth.get((code, plan))
+        if rule is None:
+            return self._err(f"no pre-authorisation rule for {code} under {plan}; refer to staff")
+        v = policies.preauth_verdict(rule, self.procedures[code], plan)
+        return {
+            "ok": True,
+            "procedure_code": code,
+            "procedure_name": self.procedures[code]["procedure_name"],
+            "plan_code": plan,
+            "covered": v.covered,
+            "preauth_required": v.preauth_required,
+            "approval_window_business_days": v.approval_window_business_days,
+            **({"referral": referral} if referral else {}),
+            "note": v.note,
+        }
+
+    # ---- 4. co-pay calculator ------------------------------------------------
+    def calculate_copay(
+        self, patient_ref: str | None = None, procedure_code: str | None = None, telehealth: bool = False
+    ) -> dict:
+        """What the patient owes (policies.copay_quote). When insurance cannot be used (no patient record or
+        no insurance, coverage not active, or the procedure not covered), the self-pay price is given instead."""
+        procedure_code = _id(procedure_code)
+        proc = self.procedures.get(procedure_code)
+        if proc is None:
+            return self._err(f"unknown procedure {procedure_code!r}", valid_codes=sorted(self.procedures))
+        self_pay = {
+            "self_pay_available": True,
+            "self_pay_usd": policies.self_pay_price(proc),
+            "payment_terms": policies.SELF_PAY_TERMS,
+        }
+        if not patient_ref:
+            return {
+                "ok": True, "procedure_code": procedure_code, "procedure_name": proc["procedure_name"],
+                "list_price_usd": proc["list_price_usd"], "patient_owes_usd": None, **self_pay,
+                "note": "no insurance given; self-pay price quoted",
+            }
+        p = self.patients.get(_id(patient_ref))
+        if p is None:
+            return self._err("no matching patient on record", found=False, **self_pay)
+        plan_code = p["plan_code"]
+        rule = self.preauth.get((procedure_code, plan_code))
+        base = {
+            "ok": True,
+            "patient_ref": p["patient_ref"],
+            "plan_code": plan_code,
+            "procedure_code": procedure_code,
+            "procedure_name": proc["procedure_name"],
+            "list_price_usd": proc["list_price_usd"],
+            "eligibility_status": p["eligibility_status"],
+            "preauth_required": bool(rule and rule["preauth_required"]),
+        }
+        if not policies.insurance_quote_allowed(p["eligibility_status"]):
+            return {**base, "patient_owes_usd": None, **self_pay,
+                    "note": f"coverage is {p['eligibility_status']}; no insurance estimate given; self-pay price quoted"}
+        if rule is not None and not rule["covered"]:
+            return {**base, "covered": False, "patient_owes_usd": None, **self_pay,
+                    "note": "not covered under this plan; self-pay price quoted"}
+        flat = {cat: amount for (plan, cat), amount in self.copays.items() if plan == plan_code}
+        q = policies.copay_quote(self.plans[plan_code], proc, p["deductible_met_usd"], flat, telehealth)
+        return {**base, "covered": True, "basis": q.basis, "patient_owes_usd": q.patient_owes_usd, "working": q.working}
+
+    # ---- 5. flag for human ---------------------------------------------------
+    def flag_for_human(self, reason: str, urgency: str = "Routine", patient_ref: str | None = None) -> dict:
+        """Hand the case to staff. Same patient and reason is recorded once, not twice."""
+        reason = (reason or "").strip()
+        if not reason:
+            return self._err("a reason is required")
+        if urgency not in URGENCIES:
+            return self._err(f"urgency must be one of {list(URGENCIES)}")
+        patient_ref = _id(patient_ref) or None
+        if patient_ref and patient_ref not in self.patients:
+            return self._err("no matching patient on record", found=False)
+        flag, duplicate = self.store.add_flag(patient_ref, reason, urgency, self._now_text())
+        return {**flag, "ok": True, "duplicate": duplicate}
+
+    # ---- dispatch ------------------------------------------------------------
+    def call(self, name: str, arguments: dict | str | None) -> dict:
+        """Run a tool by name with model-supplied arguments; always returns a dict.
+        Arguments are validated against the tool's input model (tool_contracts.py) before any logic runs."""
+        tool = TOOLS_BY_NAME.get(name)
+        if tool is None:
+            return self._err(f"unknown tool {name!r}", tools=sorted(TOOLS_BY_NAME))
+        try:
+            if isinstance(arguments, str):
+                args = tool.input_model.model_validate_json(arguments or "{}")
+            else:
+                args = tool.input_model.model_validate(arguments or {})
+        except ValidationError as exc:
+            problems = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'arguments'}: {e['msg']}" for e in exc.errors())
+            return self._err(f"bad arguments: {problems}")
+        return getattr(self, tool.name)(**args.model_dump(exclude_unset=True))

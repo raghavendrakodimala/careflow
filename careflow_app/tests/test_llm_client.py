@@ -108,3 +108,61 @@ def test_error_message_does_not_leak_the_key(monkeypatch):
     with pytest.raises(LLMClientError) as exc:
         complete_structured([], PatientRequest, _settings())
     assert "not-a-real-key" not in str(exc.value)
+
+
+def _schema_unsupported():
+    return litellm.UnsupportedParamsError("response_format is not supported", llm_provider="openrouter", model="m")
+
+
+def test_rejected_native_schema_falls_back_to_schema_in_prompt_on_the_same_model(monkeypatch):
+    # Audit B1: providers without native schema support used to fail outright.
+    calls = _install(monkeypatch, [_schema_unsupported(), GOOD])
+    out = complete_structured([{"role": "user", "content": "x"}], PatientRequest, _settings())
+    assert out.specialty == "ENT"
+    assert [c["model"] for c in calls] == ["gemini/primary", "gemini/primary"]
+    assert "response_format" in calls[0] and "response_format" not in calls[1]
+    assert "JSON Schema" in calls[1]["messages"][-1]["content"] and "urgency" in calls[1]["messages"][-1]["content"]
+
+
+def test_schema_fallback_still_validates_and_retries(monkeypatch):
+    calls = _install(monkeypatch, [_schema_unsupported(), BAD, GOOD])
+    assert complete_structured([], PatientRequest, _settings()).urgency == "Routine"
+    assert len(calls) == 3 and "failed validation" in calls[2]["messages"][-1]["content"]
+
+
+def test_schema_worded_bad_request_also_triggers_fallback(monkeypatch):
+    err = litellm.BadRequestError("Invalid JSON schema in response_format", model="m", llm_provider="openrouter")
+    calls = _install(monkeypatch, [err, GOOD])
+    assert complete_structured([], PatientRequest, _settings()).specialty == "ENT" and len(calls) == 2
+
+
+def test_unrelated_bad_request_is_not_swallowed(monkeypatch):
+    err = litellm.BadRequestError("invalid api key", model="m", llm_provider="gemini")
+    _install(monkeypatch, [err])
+    with pytest.raises(litellm.BadRequestError):
+        complete_structured([], PatientRequest, _settings())
+
+
+def test_complete_with_tools_falls_back_and_returns_message(monkeypatch):
+    msg = SimpleNamespace(content="", tool_calls=["call"])
+    calls = []
+
+    def fake(**kw):
+        calls.append(kw)
+        if len(calls) == 1:
+            raise _transient()
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(llm_client.litellm, "completion", fake)
+    out = llm_client.complete_with_tools([], [{"type": "function"}], _settings())
+    assert out is msg and [c["model"] for c in calls] == ["gemini/primary", "gemini/backup"]
+    assert calls[0]["tools"] == [{"type": "function"}]
+
+
+def test_complete_with_tools_all_models_failing_raises(monkeypatch):
+    def boom(**kw):
+        raise _transient()
+
+    monkeypatch.setattr(llm_client.litellm, "completion", boom)
+    with pytest.raises(LLMClientError, match="all models failed"):
+        llm_client.complete_with_tools([], [], _settings())
