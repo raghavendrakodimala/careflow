@@ -1,4 +1,5 @@
-"""M2 tools: mock EHR appointments, insurance eligibility, pre-authorisation, co-pay calculator, flag for human.
+"""Agent tools. M2: mock EHR appointments, insurance eligibility, pre-authorisation, co-pay calculator,
+flag for human. M3: find_patient (name plus a second identifier) and search_policies (Qdrant index).
 
 This module is the thin tool layer. It validates and normalises inputs, looks records up, and shapes the
 replies the model reads. The clinic rules live in domain/policies.py, state lives in the transactional
@@ -10,9 +11,11 @@ failure, not crash on it. IDs and codes are matched case-insensitively.
 
 from __future__ import annotations
 
+import inspect
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import ValidationError
 
@@ -32,21 +35,52 @@ def _id(value) -> str:
     return str(value or "").strip().upper()
 
 
+def _name(value) -> str:
+    """Names compare case-insensitively, ignoring extra spaces."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y")
+
+
+def _parse_date(value) -> str | None:
+    """A birth date as ISO YYYY-MM-DD. DD/MM/YYYY is the intake SOP's format (field 5)."""
+    text = " ".join(str(value).split())
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+class PolicySearch(Protocol):
+    """What the tools need from the policy index (rag.index.PolicyIndex satisfies it)."""
+
+    def search(self, query: str, limit: int = 4, specialty: str | None = None) -> list: ...
+
+
 class CareFlowTools:
     def __init__(
         self,
         data_dir: Path | str | None = None,
         store: RuntimeStore | None = None,
         clock: Clock | None = None,
+        policy_index: PolicySearch | None = None,
     ):
         """No store: a private in-memory database seeded from `data_dir` (tests, one-off runs).
-        With a store: its database, e.g. RuntimeStore() for out/runtime.db shared across restarts and processes."""
+        With a store: its database, e.g. RuntimeStore() for out/runtime.db shared across restarts and processes.
+        policy_index: the M3 Qdrant index (rag.index.PolicyIndex); without it search_policies is not offered."""
         self.store = store or RuntimeStore(":memory:", seed_dir=data_dir)
         self.clock = clock or FrozenClock()
+        self.policy_index = policy_index
         rows = self.store.rows
         # Reference data, read once. Slots, appointments and flags change, so they are always read live.
         self.patients = {r["patient_ref"]: r for r in rows("patients")}
         self._by_member = {r["member_number"]: r for r in self.patients.values()}
+        self._by_name: dict[tuple[str, str], list[dict]] = {}
+        for r in self.patients.values():
+            self._by_name.setdefault((_name(r["given_name"]), _name(r["family_name"])), []).append(r)
         self.plans = {r["plan_code"]: r for r in rows("plans")}
         self.procedures = {r["procedure_code"]: r for r in rows("procedures")}
         self.copays = {(r["plan_code"], r["service_category"]): r["copay_usd"] for r in rows("plan_copays")}
@@ -362,8 +396,18 @@ class CareFlowTools:
         return {**base, "covered": True, "basis": q.basis, "patient_owes_usd": q.patient_owes_usd, "working": q.working}
 
     # ---- 5. flag for human ---------------------------------------------------
-    def flag_for_human(self, reason: str, urgency: str = "Routine", patient_ref: str | None = None) -> dict:
-        """Hand the case to staff. Same patient and reason is recorded once, not twice."""
+    def flag_for_human(
+        self,
+        reason: str,
+        urgency: str = "Routine",
+        patient_ref: str | None = None,
+        clinical: bool = False,
+        contact_id: str | None = None,
+    ) -> dict:
+        """Hand the case to staff. Within one contact the same patient and reason is recorded once (a retry
+        is not a second ticket); a new contact always gets its own flag.
+        `clinical` marks a Clinical Routing Ticket (OP-CS-014) as opposed to an administrative handoff.
+        `contact_id` is set by the server (CareFlowTools.call context), never by the model."""
         reason = (reason or "").strip()
         if not reason:
             return self._err("a reason is required")
@@ -372,13 +416,94 @@ class CareFlowTools:
         patient_ref = _id(patient_ref) or None
         if patient_ref and patient_ref not in self.patients:
             return self._err("no matching patient on record", found=False)
-        flag, duplicate = self.store.add_flag(patient_ref, reason, urgency, self._now_text())
+        category = "clinical" if clinical else "administrative"
+        flag, duplicate = self.store.add_flag(patient_ref, reason, urgency, self._now_text(), category, contact_id)
         return {**flag, "ok": True, "duplicate": duplicate}
 
+    # ---- 6. identify a patient (M3, audit A4) ---------------------------------
+    def find_patient(
+        self,
+        given_name: str,
+        family_name: str,
+        birth_date: str | None = None,
+        member_number: str | None = None,
+    ) -> dict:
+        """Resolve a caller to a patient_ref from their name plus a second identifier.
+
+        Two identifiers, as the data-handling standard requires for identity checks: the full name and
+        either the date of birth or the member number. Every identifier given must match exactly one
+        patient. Only the patient_ref is returned (no name, birth date or plan), and a failed match never
+        says which detail was wrong, so the tool cannot be used to probe who is registered."""
+        if not (birth_date or member_number):
+            return self._err("give the date of birth or the member number as well as the full name")
+        dob = _parse_date(birth_date) if birth_date else None
+        if birth_date and dob is None:
+            return self._err("birth_date not understood; use YYYY-MM-DD or DD/MM/YYYY")
+        member = self._patient(None, member_number) if member_number else None
+        key = (_name(given_name), _name(family_name))
+        matches = [
+            p for p in self._by_name.get(key, [])
+            if (dob is None or p["birth_date"] == dob)
+            and (member_number is None or (member is not None and member["patient_ref"] == p["patient_ref"]))
+        ]
+        if len(matches) != 1:
+            return {
+                "ok": True,
+                "found": False,
+                "note": "No single patient matches those details. Do not say which detail did not match; "
+                "ask the patient to check them, or flag_for_human.",
+            }
+        return {"ok": True, "found": True, "patient_ref": matches[0]["patient_ref"]}
+
+    # ---- 7. policy search (M3; M4 adds hybrid search and reranking) ----------
+    def search_policies(self, query: str, specialty: str | None = None, limit: int = 4) -> dict:
+        """Search the clinic's policy and insurance documents. Returns passages with their document title."""
+        if self.policy_index is None:
+            return self._err("policy search is not available; flag_for_human for policy questions")
+        if not (query or "").strip():
+            return self._err("a query is required")
+        canonical = None
+        if specialty:
+            canonical = self._specialty_by_lower.get(str(specialty).strip().lower())
+            if canonical is None:
+                return self._err(f"unknown specialty {specialty!r}", valid=sorted(self.specialties))
+        hits = self.policy_index.search(query, limit=max(1, min(int(limit), 8)), specialty=canonical)
+        return {
+            "ok": True,
+            "count": len(hits),
+            "results": [h.as_dict() for h in hits],
+            "note": "Answer only from these passages and name the document. If they do not answer the "
+            "question, say so; do not fill the gap from general knowledge.",
+        }
+
+    def patients_referenced(self, arguments: dict) -> set[str]:
+        """The patients a tool call's arguments point at, through patient_ref, member_number or referral_id.
+        Used by the graph to keep a verified conversation to its own patient's records (feedback M3-5).
+        Unknown values resolve to nothing: the tool itself reports them as not found."""
+        refs = set()
+        if arguments.get("patient_ref"):
+            refs.add(_id(arguments["patient_ref"]))
+        if arguments.get("member_number"):
+            p = self._patient(None, arguments["member_number"])
+            if p:
+                refs.add(p["patient_ref"])
+        if arguments.get("referral_id"):
+            r = self.store.one("referrals", "referral_id", _id(arguments["referral_id"]))
+            if r:
+                refs.add(r["patient_ref"])
+        return refs
+
+    def available_tools(self) -> set[str]:
+        """Tools that can run with this configuration (policy search needs an index)."""
+        names = set(TOOLS_BY_NAME)
+        return names if self.policy_index is not None else names - {"search_policies"}
+
     # ---- dispatch ------------------------------------------------------------
-    def call(self, name: str, arguments: dict | str | None) -> dict:
+    def call(self, name: str, arguments: dict | str | None, context: dict | None = None) -> dict:
         """Run a tool by name with model-supplied arguments; always returns a dict.
-        Arguments are validated against the tool's input model (tool_contracts.py) before any logic runs."""
+        Arguments are validated against the tool's input model (tool_contracts.py) before any logic runs.
+        `context` holds trusted server-side values (e.g. contact_id). They are not part of the contract, so the
+        model can never set them, and each is passed only to a tool whose method accepts it."""
         tool = TOOLS_BY_NAME.get(name)
         if tool is None:
             return self._err(f"unknown tool {name!r}", tools=sorted(TOOLS_BY_NAME))
@@ -390,4 +515,7 @@ class CareFlowTools:
         except ValidationError as exc:
             problems = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'arguments'}: {e['msg']}" for e in exc.errors())
             return self._err(f"bad arguments: {problems}")
-        return getattr(self, tool.name)(**args.model_dump(exclude_unset=True))
+        method = getattr(self, tool.name)
+        accepted = inspect.signature(method).parameters
+        trusted = {k: v for k, v in (context or {}).items() if k in accepted and k not in tool.input_model.model_fields}
+        return method(**args.model_dump(exclude_unset=True), **trusted)

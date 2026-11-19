@@ -1,4 +1,4 @@
-# Handoff: CareFlow capstone (as of 2026-11-15)
+# Handoff: CareFlow capstone (as of 2026-11-19)
 
 Notes for resuming work in a new session. See also `submission-checklist.md` (what to submit) and `m1-plan.md` (the approved M1 plan).
 
@@ -10,7 +10,7 @@ Notes for resuming work in a new session. See also `submission-checklist.md` (wh
 
 ## Working rules
 - Follow the upstream data-toolkit README steps; ask before going beyond them.
-- **Do not commit until the owner says so.** Nothing has been committed yet.
+- **Do not commit until the owner says so.** M1 and M2 are committed; M3 is not.
 - Never print or commit the Gemini key. `.env` is gitignored. No real personal data.
 - Do not create new README files. The root and toolkit `README.md` and `CHANGELOG.md` are copies from the course repo.
 
@@ -21,9 +21,10 @@ capstone-data-toolkit/           generator, tests, .venv, .env (gitignored), dat
 careflow_app/
   careflow/                      M1: schemas.py, config.py, llm_client.py, intake.py
                                  M2: tools.py, tool_contracts.py, graph.py, state.py, store.py, prompts.py, agent.py
+                                 M3: memory.py; rag/ (chunker.py, embeddings.py, index.py)
     domain/                      pure rules (policies.py) and Clock; imports only the standard library
-  scripts/                       run_m1_eval.py, run_m2_demo.py (live)
-  tests/                         60 offline tests (schemas, client, tools, agent, graph, store)
+  scripts/                       run_m1_eval.py, run_m2_demo.py, build_policy_index.py, run_m3_demo.py (live)
+  tests/                         192 offline tests
   notes/                         this file, submission-checklist.md, m1-plan.md
   out/                           cached M1 predictions, logs, runtime.db (gitignored)
   requirements.txt
@@ -89,6 +90,32 @@ careflow_app/
 - Re-run the live demo with `python -m scripts.run_m2_demo` (10 scenarios, about 30 Gemini calls; needs the owner's go-ahead).
 - **Payment rule (owner decision, 2026-11-18):** when insurance cannot be used (no insurance, lapsed, invalid, procedure not covered), offer self-pay at the list price, payment due at check-in, and book only after the patient agrees. `pending_verification` is booked, and staff are flagged to verify. Details are in `feedback.md` §6.1.
 - Bug caught by a test: if the caller's `patient_ref` was unknown, the step-cap escalation was rejected and no flag was recorded while the patient was told staff had it. It now retries without the reference.
+
+## M3 status: memory plus Qdrant policy index (branch feat/krp-milestone3, not committed)
+Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
+- **Session memory:** LangGraph checkpointer per `thread_id`. `agent.session_checkpointer()` gives `SqliteSaver` on `out/sessions.db`, which survives a restart. The model sees the last 8 user turns (`HISTORY_TURNS`); the checkpoint keeps everything. A verified `patient_ref` stays on the thread.
+- **Long-term patient memory** (`memory.py`, `PatientMemory`): read from the runtime store for one verified patient. It covers recent contacts, upcoming appointments, the last completed visit, and open referrals with pre-auth status and SLA date. It also applies the triage SOP 7.3 REPEAT rule (a contact within 24 hours). A `memory` graph node rebuilds the note before every model call, so a booking made a minute ago shows up. A `record` node appends one `patient_interactions` row per turn that did tool work, using the seed's topic and outcome vocabulary. The summary comes from the tool results, never from the patient's words. Unknown patients get no memory, and nothing is recorded for them.
+- **Policy index** (`rag/`): structure-aware chunker, 164 chunks from the 14 markdown docs. Chunks never cross a section and never split a table. Each chunk starts with a `[Title | Doc ID | Section]` header and carries metadata for specialty, procedure codes and plan codes. Qdrant runs in local mode at `out/qdrant` (`:memory:` in tests). The build is idempotent, with stable uuid5 IDs and stale-chunk removal; it recreates the collection if the embedder changes. A specialty scope excludes the other 7 handbooks but keeps the clinic-wide documents.
+- **Embeddings:** `LiteLLMEmbedder`, chosen by config (`CAREFLOW_EMBEDDING_MODEL`, default `gemini/gemini-embedding-001` at 768 dimensions), with an on-disk cache in `out/embeddings.sqlite`. `local` selects the offline `HashingEmbedder`, which the tests use. fastembed and other local neural embedders are not possible: onnxruntime has no Python 3.15 build.
+- **New tools:**
+  - `find_patient` (carry-forward A4): full name plus date of birth or member number, which makes two identifiers. It returns only `patient_ref`, and gives the same reply for every kind of mismatch. A success verifies the thread's patient and loads their memory.
+  - `search_policies`: offered only when an index is configured; answers must come from the returned passages and name the document.
+- **Carry-forward done:** `tests/test_architecture.py` assigns every module a layer and fails if a module imports from its own layer or a higher one. A new package fails until it is given a layer (`workflows`/`mcp`/`api` are reserved). The tool, store, memory and rag layers must not import LangGraph.
+- Architect review fixes (`feedback.md` §5): one conversation = one contact (row updated per turn, the current thread excluded from repeat counts); clinical vs administrative flags (`flag_for_human(clinical=...)`, `staff_flags.category`); REPEAT (24h) and Repeat - Priority (3rd within 72h, OP-CS-014 8.2), counted per issue; a verified conversation cannot touch another patient's records (enforced in `tools_node`); WAL on `sessions.db`; `any_cite`/`all_cite` metric.
+- Offline tests: **192 passing**. Toolkit validator READY; `data/` unchanged.
+- Offline baseline with the hashing embedder:
+  - specialty handbook top-1: 5/8
+  - golden `must_cite`: any_cite 13/17 at k=4, 14/17 at k=5; all_cite 11/17 at both
+- **LIVE, pending owner approval:**
+  - `python -m scripts.build_policy_index`: about 5 embedding requests; prints the real-embedding baseline.
+  - `python -m scripts.run_m3_demo`: 8 checks, about 25 chat calls. They cover identity plus referral memory, session memory across a restart, long-term memory on a new conversation, a clinical repeat caller, the 72-hour Repeat - Priority rule, policy search, and two privacy probes.
+- **LIVE results (2026-11-19, Gemini):**
+  - Index build: 164 chunks, 4 embedding requests (free tier counts each text as a request, 100/min; the embedder now paces at 90 texts/min). Specialty handbook top-1 **8/8**. Golden `must_cite`: k=4 any 13/17, all 9/17; k=5 any 14/17, all 10/17 (M4 baseline).
+  - Demo: **7/8**. Failed: on a repeat clinical contact, the agent gave the deflection script but raised no staff flag (the memory showed an earlier flag). Also, in the name-only privacy probe, nothing leaked but the agent asked the third party for the patient's date of birth. Both prompt rules are tightened (every clinical question gets its own flag; find_patient only for the person you are talking to, intake SOP 3.3) and the privacy check is stricter. Log: `out/m3_demo.log`.
+  - Re-run (owner-approved): **7/8**. Both fixes held: the repeat clinical contact now raises a flag, and the third party is no longer asked for the patient's details. The flag still lacked the REPEAT marker. Fix: repeat markers are now applied in code in `tools_node` (`_mark_repeat`). It uses the records, not the model, when the issue is known (a clinical flag, or a topic set by this turn's tools), and raises the urgency to at least Priority for Repeat - Priority. Log: `out/m3_demo_rerun.log`.
+  - **Root cause** (found offline, `feedback.md` §7): the memory note was right, but staff flags were de-duplicated on (patient, reason) across all time. The model reused the first contact's reason, so the second contact got the old flag back and **no new ticket**. Fixes: per-contact de-duplication (`staff_flags.contact_id`, set by the server through `CareFlowTools.call(context=...)`, which the model cannot set); flags on a verified conversation get `patient_ref` and the repeat marker from the records (`_prepare_flag`). **192 offline tests.**
+  - **Verification run (live): 8/8 passed.** Log: `out/m3_demo_verify.log`.
+- Left for M4: PDF ingestion, sparse BM25 vectors with fusion, the reranker, the abstain threshold and the groundedness check.
 
 ## Next steps
 1. Owner: approve the live M2 demo run; decide whether to tune the urgency prompt; decide on the `pending_verification` booking rule.
