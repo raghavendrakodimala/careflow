@@ -13,7 +13,13 @@ TOOLKIT_DIR = REPO_ROOT / "capstone-data-toolkit"
 DATA_DIR = TOOLKIT_DIR / "data" / "careflow"
 # Runtime SQLite database (bookings, flags), seeded from DATA_DIR's CSVs. Gitignored via out/.
 # The seeded DATA_DIR is never written.
-RUNTIME_DB = Path(os.environ.get("CAREFLOW_RUNTIME_DB") or REPO_ROOT / "careflow_app" / "out" / "runtime.db")
+OUT_DIR = REPO_ROOT / "careflow_app" / "out"
+RUNTIME_DB = Path(os.environ.get("CAREFLOW_RUNTIME_DB") or OUT_DIR / "runtime.db")
+# M3: session checkpoints (LangGraph SqliteSaver), the local Qdrant policy index, and an embedding cache
+# so rebuilding the index never pays for the same text twice. All gitignored via out/.
+SESSIONS_DB = Path(os.environ.get("CAREFLOW_SESSIONS_DB") or OUT_DIR / "sessions.db")
+QDRANT_PATH = Path(os.environ.get("CAREFLOW_QDRANT_PATH") or OUT_DIR / "qdrant")
+EMBED_CACHE = Path(os.environ.get("CAREFLOW_EMBED_CACHE") or OUT_DIR / "embeddings.sqlite")
 
 
 class Settings(BaseSettings):
@@ -34,6 +40,12 @@ class Settings(BaseSettings):
         "", validation_alias=AliasChoices("DATAGEN_OPENROUTER_API_KEY", "OPENROUTER_API_KEY")
     )
     ollama_host: str = Field("http://localhost:11434", validation_alias="DATAGEN_OLLAMA_HOST")
+
+    # M3 policy index. Any LiteLLM embedding model; "local" uses the offline hashing embedder (no API).
+    careflow_embedding_model: str = "gemini/gemini-embedding-001"
+    careflow_embedding_dimensions: int = 768
+    # Gemini's free tier counts each embedded text as a request: 100 per minute. Stay under it.
+    careflow_embedding_texts_per_minute: int = 90
 
     request_timeout_s: int = 90
     transport_retries: int = 3

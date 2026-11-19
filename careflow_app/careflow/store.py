@@ -78,6 +78,28 @@ class RuntimeStore:
         if not self.in_memory:
             self.conn.execute("PRAGMA journal_mode=WAL")  # readers never block the single writer
         self._seed_if_needed()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive changes for databases seeded by an earlier milestone (safe to run on every open)."""
+        with self._tx() as c:
+            # M3: per-patient memory reads go straight to one patient's rows.
+            c.execute("CREATE INDEX IF NOT EXISTS ix_interactions_patient ON patient_interactions(patient_ref)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_referrals_patient ON referrals(patient_ref)")
+            # M3: one interaction row per conversation (thread); blank on seeded rows.
+            if "thread_id" not in self._columns(c, "patient_interactions"):
+                c.execute("ALTER TABLE patient_interactions ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''")
+            # M3: clinical vs administrative staff flags (M5's human-in-the-loop step routes on this).
+            if "category" not in self._columns(c, "staff_flags"):
+                c.execute("ALTER TABLE staff_flags ADD COLUMN category TEXT NOT NULL DEFAULT 'administrative'")
+            # M3: the contact (conversation) a flag was raised in. De-duplication is per contact, so a
+            # retry does not create a second ticket but a new contact always gets its own (OP-CS-014 8.2).
+            if "contact_id" not in self._columns(c, "staff_flags"):
+                c.execute("ALTER TABLE staff_flags ADD COLUMN contact_id TEXT")
+
+    @staticmethod
+    def _columns(c, table: str) -> set[str]:
+        return {r[1] for r in c.execute(f"PRAGMA table_info({_q(table)})")}
 
     @contextmanager
     def _tx(self):
@@ -143,6 +165,12 @@ class RuntimeStore:
             row = self.conn.execute(f"SELECT * FROM {_q(table)} WHERE {_q(key)} = ?", (value,)).fetchone()
         return _typed(dict(row)) if row else None
 
+    def rows_for_patient(self, table: str, patient_ref: str) -> list[dict]:
+        """One patient's rows only. Memory reads go through this, so another patient's rows are never loaded."""
+        with self._lock:
+            cur = self.conn.execute(f"SELECT * FROM {_q(table)} WHERE patient_ref = ?", (patient_ref,))
+            return [_typed(dict(r)) for r in cur]
+
     def flags(self) -> list[dict]:
         with self._lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM staff_flags ORDER BY flag_id")]
@@ -178,15 +206,86 @@ class RuntimeStore:
         last = c.execute("SELECT MAX(CAST(substr(appointment_id, 7) AS INTEGER)) FROM appointments").fetchone()[0]
         return f"MHP-A-{(last if last is not None else -1) + 1:06d}"
 
-    def add_flag(self, patient_ref: str | None, reason: str, urgency: str, created_at: str) -> tuple[dict, bool]:
-        """Record a staff flag; the same patient and reason is stored once. Returns (flag, was_duplicate)."""
+    def add_flag(
+        self,
+        patient_ref: str | None,
+        reason: str,
+        urgency: str,
+        created_at: str,
+        category: str = "administrative",
+        contact_id: str | None = None,
+    ) -> tuple[dict, bool]:
+        """Record a staff flag. The same patient and reason within the same contact is stored once (a retry
+        is not a second ticket); a later contact gets its own flag. Returns (flag, was_duplicate)."""
         with self._tx() as c:
-            return self._insert_flag(c, patient_ref=patient_ref, reason=reason, urgency=urgency, created_at=created_at)
+            return self._insert_flag(
+                c, patient_ref=patient_ref, reason=reason, urgency=urgency, created_at=created_at, category=category,
+                contact_id=contact_id,
+            )
+
+    def interaction_for_thread(self, patient_ref: str, thread_id: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM patient_interactions WHERE patient_ref = ? AND thread_id = ?", (patient_ref, thread_id)
+            ).fetchone()
+        return _typed(dict(row)) if row else None
+
+    def add_interaction(
+        self,
+        patient_ref: str,
+        occurred_at: str,
+        channel: str,
+        topic: str,
+        outcome: str,
+        summary: str,
+        referral_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict:
+        """Record one contact in patient_interactions (M3 long-term memory), in the seed table's format.
+
+        With a thread_id, a conversation is one contact: the first call adds the row and later calls on the
+        same thread update its topic, outcome and summary (occurred_at stays the start of the contact)."""
+        with self._tx() as c:
+            if thread_id:
+                existing = c.execute(
+                    "SELECT interaction_id FROM patient_interactions WHERE patient_ref = ? AND thread_id = ?",
+                    (patient_ref, thread_id),
+                ).fetchone()
+                if existing:
+                    c.execute(
+                        "UPDATE patient_interactions SET topic = ?, outcome = ?, summary = ?, referral_id = ? "
+                        "WHERE interaction_id = ?",
+                        (topic, outcome, summary, referral_id or "", existing[0]),
+                    )
+                    row = c.execute("SELECT * FROM patient_interactions WHERE interaction_id = ?", (existing[0],))
+                    return _typed(dict(row.fetchone()))
+            last = c.execute(
+                "SELECT MAX(CAST(substr(interaction_id, 7) AS INTEGER)) FROM patient_interactions"
+            ).fetchone()[0]
+            row = {
+                "interaction_id": f"MHP-I-{(last if last is not None else -1) + 1:05d}",
+                "patient_ref": patient_ref,
+                "occurred_at": occurred_at,
+                "channel": channel,
+                "topic": topic,
+                "outcome": outcome,
+                "summary": summary,
+                "referral_id": referral_id or "",
+                "thread_id": thread_id or "",
+            }
+            c.execute(
+                f"INSERT INTO patient_interactions ({', '.join(_q(k) for k in row)}) VALUES ({', '.join('?' * len(row))})",
+                tuple(row.values()),
+            )
+        return _typed(row)
 
     @staticmethod
-    def _insert_flag(c, patient_ref, reason, urgency, created_at) -> tuple[dict, bool]:
+    def _insert_flag(
+        c, patient_ref, reason, urgency, created_at, category="administrative", contact_id=None
+    ) -> tuple[dict, bool]:
         existing = c.execute(
-            "SELECT * FROM staff_flags WHERE patient_ref IS ? AND reason = ?", (patient_ref, reason)
+            "SELECT * FROM staff_flags WHERE patient_ref IS ? AND reason = ? AND contact_id IS ?",
+            (patient_ref, reason, contact_id),
         ).fetchone()
         if existing:
             return dict(existing), True
@@ -198,6 +297,10 @@ class RuntimeStore:
             "urgency": urgency,
             "status": "awaiting_staff",
             "created_at": created_at,
+            "category": category,
+            "contact_id": contact_id,
         }
-        c.execute("INSERT INTO staff_flags VALUES (?, ?, ?, ?, ?, ?)", tuple(flag.values()))
+        c.execute(
+            f"INSERT INTO staff_flags ({', '.join(flag)}) VALUES ({', '.join('?' * len(flag))})", tuple(flag.values())
+        )
         return flag, False

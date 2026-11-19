@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .schemas import PlanCode, Urgency
+from .schemas import PlanCode, Specialty, Urgency
 
 
 class _Input(BaseModel):
@@ -75,6 +75,25 @@ class FlagForHumanInput(_Input):
     reason: str = Field(description="why staff are needed, in one sentence")
     urgency: Urgency = "Routine"
     patient_ref: str | None = None
+    clinical: bool = Field(
+        False, description="true for a clinical question or emergency (symptoms, diagnosis, medication, dosing, "
+        "results); false for an administrative handoff"
+    )
+
+
+class FindPatientInput(_Input):
+    given_name: str
+    family_name: str
+    birth_date: str | None = Field(None, description="date of birth, e.g. 1981-12-26 or 26/12/1981")
+    member_number: str | None = Field(None, description="insurance member number, e.g. MER90272292")
+
+
+class SearchPoliciesInput(_Input):
+    query: str = Field(description="the policy or coverage question, in plain words")
+    specialty: Specialty | None = Field(
+        None, description="set only for a question about one specialty's service line handbook"
+    )
+    limit: int = Field(4, description="max passages, default 4")
 
 
 @dataclass(frozen=True)
@@ -152,6 +171,21 @@ TOOLS: tuple[ToolDefinition, ...] = (
         "medication or dosing), anything urgent, and anything the other tools cannot settle.",
         FlagForHumanInput,
         idempotent=True,  # same patient and reason is recorded once
+    ),
+    ToolDefinition(
+        "find_patient",
+        "Identify the patient you are talking to when you have no patient_ref: their full name plus their "
+        "date of birth or member number. Returns only the patient_ref.",
+        FindPatientInput,
+        idempotent=True,
+    ),
+    ToolDefinition(
+        "search_policies",
+        "Search the clinic's policy and insurance documents (referral policy, pre-authorisation matrix, "
+        "cost-share schedule, intake SOP, data handling, specialty handbooks) for rules, preparation "
+        "instructions, timings and coverage terms. Returns passages with their document title.",
+        SearchPoliciesInput,
+        idempotent=True,
     ),
 )
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}

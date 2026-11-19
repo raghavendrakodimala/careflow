@@ -5,3 +5,4 @@ pydantic>=2.7
 pydantic-settings>=2.2
 pytest
 tenacity
+qdrant-client>=1.12
