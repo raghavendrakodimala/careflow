@@ -133,13 +133,43 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
   - Run 3, final prompt (`out/m4_agent_live3.log`): **19/20**, multi-hop naming every cited document 4/6. Same as run 2; the records-only third-party rule broke no other case. EV-904 is answered (no refusal) but again without the $160 co-pay.
   - **Known gap, EV-904:** the agent now rebuts the pre-authorisation claim (5 business days) but not "100 percent" with the $160 imaging co-pay. "MRI" names no procedure code, so `calculate_copay` cannot be used, and the co-pay schedule's plan-terms chunk reranks at 0.25 against 0.99 for the handbooks. A second prompt rule (check every claim with its tool) did not help and was reverted.
 
+## M5 status: triage workflow with human review and checkpoints (branch feat/krp-milestone5, not committed)
+- **Requirement source:** no copy of the project brief is in the repo. M5 was scoped from the toolkit README ("Referral tracking and SLA (M5)", "Pre-authorisation check (M2, M5)", intake `ground_truth` = "your M5 routing labels") and the architect's notes (`feedback.md` 8.3).
+- **Owner decisions (2026-11-21):**
+  - *Act, then pause.* The deflection script, the emergency statement and the clinical ticket go out before the pause, because OP-CS-014 6.1, 8.1 and 9.6 allow no delay. This replaces the earlier wording "human-in-the-loop step before clinical escalation".
+  - *Lean scope.* Existing referrals are read; none are created or changed.
+- **Workflow** (`careflow/workflows/`, layer 6): `intake -> hydrate -> (deflect | eligibility -> routing -> assist) -> decide -> (review) -> finalize`. The step order is fixed in code. The model is used only to parse the message (M1 `parse_intake`) and to write the reply (`assist` runs the existing agent via `run_agent`).
+- **Routes** (`domain/policies.triage_route`, the golden set's `expected_route` values):
+  - `refuse`: clinical question or Emergent. Script (plus emergency statement), clinical flag, no referral or booking. An unreadable message fails closed to this route (OP-CS-014 9.3).
+  - `human_review`: Urgent band; patient not identified; no specialty; sign-off specialty with no referral on file; Pulmonology or ENT with no referral on file (in neither policy list); latest referral rejected; referral still `open` (not yet accepted); referral pre-auth pending or denied; open referral past its SLA date; third contact in 72h. Also when the assistant flags staff, finds nothing in the policies, fails the grounding check, hits its step limit or is unavailable.
+  - `auto`: everything else. Lapsed or unverified cover is never a refusal (SOP 5.4).
+- **Human review:** `decide` raises the staff flag and a row in the new `reviews` table, then `review` pauses with LangGraph `interrupt`. `resume_triage(thread_id, {reviewer_id, action, note, urgency})` records the decision and closes the flag in one transaction. While paused, `book_appointment` is not offered to the assistant. A decision with no reviewer, an unknown action, or a lower band without a note is rejected and the case stays paused.
+- **Checkpoints:** `session_checkpointer()` (SQLite, `out/sessions.db`). A paused case is resumed by a new process without repeating a flag or a model call (`test_paused_case_survives_a_restart...`).
+- **New domain rules** (`domain/policies.py`): `add_business_days`, `referral_due`, `sign_off_required`, `highest_band`, `triage_route`. `referral_due` reproduces `sla_due_on` for all 300 seeded referrals.
+- **Interface for M8:** `start_triage`, `pending_review`, `resume_triage`, `TriageResult` in `careflow.workflows`. `run_agent` gained `tool_names`.
+- **Architect review** (`feedback.md`, M5-1 to M5-6): all five P1 findings fixed; responses in `feedback.md` section 6. Main changes:
+  - Identity: an unverified caller is matched only on full name plus member number (`find_patient`).
+  - Band: SOP 4.6 trigger phrases are a floor under the parsed band (`policies.trigger_band`), and the band when parsing fails. A flag the assistant raised is brought up to the workflow's band and reasons (`store.promote_flag`). Emergent is never lowered.
+  - Memory: the contact's row is updated with the outcome and flag once the route is known (`PatientMemory.record_outcome`).
+  - One case per `thread_id` (`AlreadyTriaged`); pausing and resuming need a checkpointer.
+  - Not done, on purpose: sending `covered=False` to staff (the owner's self-pay rule of 2026-11-18 applies), and detecting "asking about someone else" at intake.
+- Offline tests: **365 passing** (`test_referral_rules.py`, `test_workflow.py`, `test_workflow_review.py`, two more in `test_store.py`). Validator READY; `data/` unchanged.
+- **Routing check, offline** (`python -m scripts.run_m5_eval`, 200 intake records, assistant off, parses from `out/m1_predictions.jsonl`): same route as the ground-truth labels on **188/197 (95%)**. Should-be-refused but not refused: **0**. All 9 differences are refusals where the labels say human review (M1 urgency disagreements). Route mix from the M1 parses: auto 25, human_review 114, refuse 61.
+- **Why human review is 114/200:** 77 are sign-off specialties with no referral on file and 29 are ENT or Pulmonology with no referral. Both follow the referral policy as written; the architect confirmed this reading (`feedback.md` M5-6a).
+- **Not run yet (LIVE, needs the owner's go-ahead):** `python -m scripts.run_m5_demo`, 4 messages, about 15 chat calls.
+- **Out of scope, on purpose:** creating or updating referrals, SLA extensions (3.10), the escalation ladder (3.12), the intake SOP's 12 mandatory fields beyond `PatientRequest`, age floors per specialty, checking the golden set's `expected_route` (EV-020 is `refuse` for an unanswerable question while EV-905 is `human_review`; the workflow sends both to `human_review`).
+- **Limits to know:**
+  - The repeat-contact band floor reads the earlier band from staff flags in the last 24h, because contacts do not store a band.
+  - The topic of a non-clinical message is inferred from keywords (`policies.intake_topic`); anything unmatched counts as an appointment request.
+  - Trigger-phrase matching has no negation handling: "no chest pain" is banded Emergent (SOP 4.4, upgrade on doubt).
+
 ## Next steps
 1. Owner: approve the live M2 demo run; decide whether to tune the urgency prompt; decide on the `pending_verification` booking rule.
 2. Optional: show the client is provider-agnostic by running 5 records on OpenRouter (the key is in the toolkit `.env`; model and cost not yet checked). Ollama is not installed.
 3. M3 to M8:
    - M3: session memory = graph `thread_id` + checkpointer; long-term memory = a node before `model` reading `patient_interactions` and `appointments` from the runtime store; Qdrant index over the corpus.
    - M4: RAG with hybrid search and reranking; groundedness evaluation.
-   - M5: LangGraph workflow with checkpointing and a human-in-the-loop step before clinical escalation.
+   - M5: done (see M5 status).
    - M6: multi-agent team; mock EHR exposed as an MCP server.
    - M7: LangFuse tracing; retries, fallbacks, circuit breaker.
    - M8: guardrails against clinical advice, golden-set run, FastAPI service.

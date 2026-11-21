@@ -202,7 +202,24 @@ class PatientMemory:
         if patient_ref is None:
             return None
         own_referrals = {r["referral_id"] for r in self.store.rows_for_patient("referrals", patient_ref)}
-        turn = summarise_turn(tool_calls, answer, own_referrals)
+        return self._save(patient_ref, summarise_turn(tool_calls, answer, own_referrals), channel, thread_id)
+
+    def record_outcome(self, patient_ref: str | None, topic: str, flag: dict, channel: str = "web_form",
+                       thread_id: str | None = None) -> dict | None:
+        """M5: record that the triage workflow handed this contact to staff with `flag`. The workflow knows
+        the outcome only after the assistant's turn was recorded, so this merges into the thread's row.
+        `topic` is what the message was about; it replaces "general_enquiry" so the repeat rules still see it."""
+        patient_ref = self._known(patient_ref)
+        if patient_ref is None:
+            return None
+        clinical = flag.get("category") == "clinical"
+        call = {"name": "flag_for_human", "arguments": {"clinical": clinical}, "result": {**flag, "ok": True}}
+        turn = summarise_turn([call])
+        if turn["topic"] == NO_ISSUE and topic in TOPIC_SUMMARY:
+            turn = {**turn, "topic": topic, "summary": _summary(topic, [d.strip() for d in _details(turn)])}
+        return self._save(patient_ref, turn, channel, thread_id)
+
+    def _save(self, patient_ref: str, turn: dict, channel: str, thread_id: str | None) -> dict:
         previous = self.store.interaction_for_thread(patient_ref, thread_id) if thread_id else None
         merged = merge_contact(previous, turn) if previous else turn
         return self.store.add_interaction(

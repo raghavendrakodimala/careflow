@@ -10,7 +10,7 @@ On first use the store creates its tables from those CSVs; afterwards all state 
 A booking is one transaction: the slot moves from open to booked only if it is still open (so two callers
 can never both book it), the appointment row is added, and any staff flag is recorded, or none of it is.
 Runtime-only columns: appointments.slot_id and appointments.payment (blank on seeded rows), and the
-staff_flags table (no seeded equivalent).
+staff_flags table (no seeded equivalent). M5 adds the reviews table (human-review requests and decisions).
 """
 
 from __future__ import annotations
@@ -96,6 +96,12 @@ class RuntimeStore:
             # retry does not create a second ticket but a new contact always gets its own (OP-CS-014 8.2).
             if "contact_id" not in self._columns(c, "staff_flags"):
                 c.execute("ALTER TABLE staff_flags ADD COLUMN contact_id TEXT")
+            # M5: one row per human-review request of the triage workflow, and the staff decision on it.
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS reviews (review_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE, "
+                "flag_id TEXT, patient_ref TEXT, route TEXT NOT NULL, reasons TEXT NOT NULL, requested_at TEXT NOT NULL, "
+                "status TEXT NOT NULL, reviewer_id TEXT, action TEXT, note TEXT, urgency TEXT, decided_at TEXT)"
+            )
 
     @staticmethod
     def _columns(c, table: str) -> set[str]:
@@ -279,6 +285,86 @@ class RuntimeStore:
             )
         return _typed(row)
 
+    # ---- human review (M5) ------------------------------------------------------------------
+    def add_review(self, thread_id: str, route: str, reasons: list[str], requested_at: str,
+                   flag_id: str | None = None, patient_ref: str | None = None) -> dict:
+        """Record that a workflow run is waiting for staff. One per thread: asking again returns the same row."""
+        with self._tx() as c:
+            row = c.execute("SELECT * FROM reviews WHERE thread_id = ?", (thread_id,)).fetchone()
+            if row:
+                return dict(row)
+            n = (c.execute("SELECT MAX(CAST(substr(review_id, 5) AS INTEGER)) FROM reviews").fetchone()[0] or 0) + 1
+            review = {
+                "review_id": f"REV-{n:04d}", "thread_id": thread_id, "flag_id": flag_id, "patient_ref": patient_ref,
+                "route": route, "reasons": "; ".join(reasons), "requested_at": requested_at, "status": "pending",
+                "reviewer_id": None, "action": None, "note": None, "urgency": None, "decided_at": None,
+            }
+            c.execute(
+                f"INSERT INTO reviews ({', '.join(review)}) VALUES ({', '.join('?' * len(review))})",
+                tuple(review.values()),
+            )
+        return review
+
+    def decide_review(self, review_id: str, reviewer_id: str, action: str, decided_at: str,
+                      note: str | None = None, urgency: str | None = None) -> dict:
+        """Record the staff decision and close the review's flag, in one transaction. A review that is
+        already decided is returned unchanged (a retried resume records nothing twice)."""
+        with self._tx() as c:
+            row = c.execute("SELECT * FROM reviews WHERE review_id = ?", (review_id,)).fetchone()
+            if row is None:
+                raise KeyError(review_id)
+            if row["status"] == "pending":
+                c.execute(
+                    "UPDATE reviews SET status = 'decided', reviewer_id = ?, action = ?, note = ?, urgency = ?, "
+                    "decided_at = ? WHERE review_id = ?",
+                    (reviewer_id, action, note, urgency, decided_at, review_id),
+                )
+                if row["flag_id"]:
+                    c.execute(
+                        "UPDATE staff_flags SET status = ?, urgency = COALESCE(?, urgency) WHERE flag_id = ?",
+                        (f"reviewed_{action}", urgency, row["flag_id"]),
+                    )
+            return dict(c.execute("SELECT * FROM reviews WHERE review_id = ?", (review_id,)).fetchone())
+
+    def review(self, review_id: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM reviews WHERE review_id = ?", (review_id,)).fetchone()
+        return dict(row) if row else None
+
+    def pending_reviews(self) -> list[dict]:
+        """The staff queue: undecided reviews, oldest first."""
+        with self._lock:
+            cur = self.conn.execute("SELECT * FROM reviews WHERE status = 'pending' ORDER BY review_id")
+            return [dict(r) for r in cur]
+
+    def promote_flag(self, flag_id: str, urgency: str, order: tuple[str, ...], prefix: str | None = None,
+                     detail: str | None = None) -> dict:
+        """Bring a flag someone else raised up to the workflow's view of the case: urgency is raised to
+        at least `urgency` (never lowered; `order` is lowest to highest), and the repeat marker and the
+        triage reasons are added to its reason if they are not there yet."""
+        with self._tx() as c:
+            row = c.execute("SELECT * FROM staff_flags WHERE flag_id = ?", (flag_id,)).fetchone()
+            if row is None:
+                raise KeyError(flag_id)
+            reason = row["reason"]
+            if detail and detail not in reason:
+                reason = f"{reason} | {detail}"
+            if prefix and not reason.lower().startswith(prefix.lower()):
+                reason = f"{prefix}: {reason}"
+            top = max(row["urgency"], urgency, key=lambda u: order.index(u) if u in order else -1)
+            c.execute("UPDATE staff_flags SET urgency = ?, reason = ? WHERE flag_id = ?", (top, reason, flag_id))
+            return dict(c.execute("SELECT * FROM staff_flags WHERE flag_id = ?", (flag_id,)).fetchone())
+
+    def flag(self, flag_id: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM staff_flags WHERE flag_id = ?", (flag_id,)).fetchone()
+        return dict(row) if row else None
+
+    def flags_for_patient(self, patient_ref: str) -> list[dict]:
+        with self._lock:
+            cur = self.conn.execute("SELECT * FROM staff_flags WHERE patient_ref = ? ORDER BY flag_id", (patient_ref,))
+            return [dict(r) for r in cur]
+
     @staticmethod
     def _insert_flag(
         c, patient_ref, reason, urgency, created_at, category="administrative", contact_id=None
@@ -289,7 +375,7 @@ class RuntimeStore:
         ).fetchone()
         if existing:
             return dict(existing), True
-        n = c.execute("SELECT COUNT(*) FROM staff_flags").fetchone()[0] + 1
+        n = (c.execute("SELECT MAX(CAST(substr(flag_id, 6) AS INTEGER)) FROM staff_flags").fetchone()[0] or 0) + 1
         flag = {
             "flag_id": f"FLAG-{n:04d}",
             "patient_ref": patient_ref,

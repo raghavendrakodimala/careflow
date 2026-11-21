@@ -178,3 +178,30 @@ def test_the_seeded_files_are_never_modified(tmp_path):
     s.close()
     assert _seed_hashes() == before
     assert not any(p.suffix == ".db" for p in Path(DATA_DIR).rglob("*"))
+
+
+# ---- M5: human-review requests and decisions ----------------------------------------------------------
+def test_review_round_trip_closes_its_flag(db):
+    s = RuntimeStore(db)
+    flag, _ = s.add_flag(None, "Triage review needed", "Urgent", "2026-08-01T09:00", contact_id="t1")
+    review = s.add_review("t1", "human_review", ["Urgent band", "No specialty"], "2026-08-01T09:00", flag_id=flag["flag_id"])
+    assert review["review_id"] == "REV-0001" and review["status"] == "pending"
+    assert review["reasons"] == "Urgent band; No specialty"
+    assert s.add_review("t1", "human_review", ["again"], "2026-08-01T09:05") == review  # one per thread
+    assert [r["review_id"] for r in s.pending_reviews()] == ["REV-0001"]
+
+    decided = s.decide_review("REV-0001", "RN-7", "approve", "2026-08-01T09:30", note="Called.", urgency="Priority")
+    assert (decided["status"], decided["reviewer_id"], decided["decided_at"]) == ("decided", "RN-7", "2026-08-01T09:30")
+    assert s.pending_reviews() == []
+    assert (s.flags()[0]["status"], s.flags()[0]["urgency"]) == ("reviewed_approve", "Priority")
+    # A second decision changes nothing: the first reviewer stays on record.
+    assert s.decide_review("REV-0001", "RN-9", "reject", "2026-08-01T10:00") == decided
+    s.close()
+    again = RuntimeStore(db)  # survives a restart; re-opening does not recreate or clear the table
+    assert again.review("REV-0001") == decided
+    again.close()
+
+
+def test_deciding_an_unknown_review_raises():
+    with pytest.raises(KeyError):
+        RuntimeStore(":memory:").decide_review("REV-9999", "RN-1", "approve", "2026-08-01T09:00")

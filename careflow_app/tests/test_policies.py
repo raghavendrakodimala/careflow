@@ -91,7 +91,7 @@ def test_domain_layer_imports_no_framework_or_outer_layer():
 
     import careflow.domain as domain
 
-    allowed_top = {"__future__", "collections", "dataclasses", "datetime", "typing"}
+    allowed_top = {"__future__", "collections", "dataclasses", "datetime", "re", "typing"}  # standard library only
     for path in Path(domain.__file__).parent.glob("*.py"):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.ImportFrom) and node.level:  # relative: must stay inside domain/
