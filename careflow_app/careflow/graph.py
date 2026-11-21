@@ -1,20 +1,24 @@
 """The CareFlow agent as a LangGraph graph.
 
-    START -> memory -> model -> tools -> memory -> model ... -> record -> END
+    START -> memory -> model -> tools -> memory -> model ... -> ground -> record -> END
                                   tools -> escalate (step cap) -> record -> END
 
   memory    M3: rebuilds the verified patient's long-term memory note from the runtime store
   model     calls the LLM with the system prompt, the memory note and a rolling window of recent turns
   tools     runs the requested tools; a successful find_patient sets the thread's verified patient_ref
+  ground    M4: the final answer arrives as a draft; if the conversation window holds a policy search or
+            the answer names a corpus document, every figure and citation in it must be supported
+            (grounding.py). Supported: the draft is the answer.
+            Not supported: it is withheld, staff are flagged and the patient is told so
   escalate  the step cap was reached: flag staff and say so, never leave silence
   record    M3: appends one interaction for this turn to the patient's history
 
 Built to be extended, not edited:
-  M4  improve search_policies (hybrid + rerank) in rag/ (no graph change)
+  M4  search_policies is hybrid + rerank + abstain in rag/ (no graph change); `ground` checks the answer
   M5  call this graph (or its pieces) as a step of the intake -> eligibility -> routing workflow
   M6  call build_agent_graph() once per agent with its own system_prompt and tool_names
   M7  wrap Deps.model and Deps.tools.call with retries / a circuit breaker
-  M8  insert a guard node between `model` and `record`
+  M8  insert a guard node after `ground`: it checks the same draft before it is committed
 Session memory is the checkpointer (one thread_id per conversation); see agent.run_agent.
 """
 
@@ -31,8 +35,9 @@ from langgraph.graph import END, START, StateGraph
 
 from .config import Settings
 from .llm_client import complete_with_tools
+from .grounding import GroundingResult, check_answer, corpus_documents, names_a_document
 from .memory import PRIORITY_MARK, PatientMemory, summarise_turn
-from .prompts import SYSTEM_PROMPT
+from .prompts import DEFLECTION_SCRIPT, EMERGENCY_STATEMENT, SYSTEM_PROMPT
 from .state import CareFlowState
 from .tools import TOOL_SPECS, CareFlowTools
 
@@ -40,6 +45,15 @@ MAX_STEPS = 6
 HISTORY_TURNS = 8  # user turns the model sees; older turns stay in the checkpoint but are not sent
 ESCALATION_REASON = "Assistant could not finish the request within its step limit"
 ESCALATION_ANSWER = "I could not complete this request, so I have passed it to clinic staff who will follow up."
+GROUNDING_REASON = "Policy answer withheld: not supported by the clinic's documents"
+GROUNDING_ANSWER = (
+    "I could not confirm that answer in the clinic's policy documents, so I have not given it. I have passed "
+    "your question to clinic staff, who will follow up."
+)
+CLINICAL_TICKET_REASON = "Clinical question deflected; Clinical Routing Ticket created automatically (OP-CS-014 9.6)"
+# The parts of the two fixed scripts that identify them (lower case, whitespace collapsed).
+DEFLECTION_MARK = "a licensed nurse will contact you within 4 business hours"
+EMERGENCY_MARK = "please hang up and call 911 now"
 OTHER_PATIENT_ERROR = (
     "This conversation is verified for one patient, so only that patient's records can be used. Do not share "
     "anything about anyone else; another person must contact the clinic themselves."
@@ -161,6 +175,7 @@ def build_agent_graph(
         tool_names = deps.tools.available_tools()
     specs = [s for s in TOOL_SPECS if s["function"]["name"] in tool_names]
     allowed = {s["function"]["name"] for s in specs}
+    documents = corpus_documents()  # for the phantom-citation check
 
     def memory_node(state: CareFlowState, config: RunnableConfig) -> dict:
         if deps.memory is None:
@@ -175,9 +190,82 @@ def build_agent_graph(
         msg = deps.model([*prefix, *recent_turns(state["messages"], history_turns)], specs)
         calls = getattr(msg, "tool_calls", None) or []
         entry: dict = {"role": "assistant", "content": msg.content or ""}
+        steps = state.get("steps", 0) + 1
         if calls:
             entry["tool_calls"] = [_call_as_dict(c) for c in calls]
-        return {"messages": [entry], "steps": state.get("steps", 0) + 1}
+            return {"messages": [entry], "steps": steps, "draft": None}
+        return {"draft": entry, "steps": steps}  # a final answer is committed by `ground`, after the check
+
+    def ground_node(state: CareFlowState, config: RunnableConfig) -> dict:
+        draft = state["draft"]
+        content = draft.get("content") or ""
+        messages = state["messages"]
+        # Sources: everything the model was shown (the same window model_node sends), not just this turn.
+        window = recent_turns(messages, history_turns)
+        seen = turn_tool_calls(window, 0)
+        # Checked when the model could be answering from policy passages (a search anywhere in the window,
+        # so a follow-up that reuses an earlier search is checked too) or names a corpus document.
+        if not any(c["name"] == "search_policies" for c in seen) and not names_a_document(content, documents):
+            result = GroundingResult()
+        else:
+            result = check_answer(
+                content,
+                passages=[p for c in seen if c["name"] == "search_policies" for p in c["result"].get("results", [])],
+                # Only the scripts the model must say word for word, not the whole system prompt: its internal
+                # rules (24 / 72 hours, OP-CS-014) would otherwise ground any answer (feedback M4-2b).
+                trusted_sources=[DEFLECTION_SCRIPT, EMERGENCY_STATEMENT, state.get("patient_memory") or "",
+                                 *(m["content"] for m in window if m["role"] == "assistant" and m.get("content"))],
+                tool_results=[c["result"] for c in seen if c["name"] != "search_policies"],
+                user_messages=[m["content"] for m in window if m["role"] == "user"],
+                known_documents=documents,
+            )
+        if result.grounded:
+            final = [draft]
+        else:
+            # Withhold the answer: hand to staff and say so (an unsupported coverage figure is worse than
+            # none). The reason names no withheld figure: the flag call is part of the history the model
+            # sees next turn. Which figures failed is in state["grounding"] (AgentResult.grounding, M7).
+            final = [*_staff_flag(state, config, GROUNDING_REASON, "Routine", False, "ground-1"),
+                     {"role": "assistant", "content": GROUNDING_ANSWER}]
+        return {"messages": _with_clinical_ticket(state, config, final), "draft": None, "grounding": result.as_dict()}
+
+    def _staff_flag(state: CareFlowState, config: RunnableConfig, reason: str, urgency: str, clinical: bool,
+                    call_id: str) -> list[dict]:
+        """A flag raised by the graph itself, as an assistant tool call plus its result (so the trace, memory
+        and AgentResult.tool_calls see it like any other). Through deps.tools.call, the M7 seam."""
+        args: dict = {"reason": reason, "urgency": urgency, **({"clinical": True} if clinical else {})}
+        raw: Any = args
+        bound = state.get("patient_ref")
+        if bound:  # patient_ref and the repeat rules (OP-CS-014 8.2) from the records
+            raw = _prepare_flag(deps.memory, json.dumps(args), bound, turn_tool_calls(state["messages"]),
+                                _thread_id(config))
+        context = {"contact_id": _contact_id(config)}
+        flag = deps.tools.call("flag_for_human", raw, context=context)
+        if not flag.get("ok") and bound:
+            # e.g. an unknown caller-supplied patient_ref (feedback M4-1): the patient is told staff will
+            # follow up, so the ticket must exist. Flag without the reference, keeping it in the reason.
+            raw = {**args, "reason": f"{reason} (unverified patient reference: {bound})"}
+            flag = deps.tools.call("flag_for_human", raw, context=context)
+        call = {"id": call_id, "type": "function",
+                "function": {"name": "flag_for_human", "arguments": raw if isinstance(raw, str) else json.dumps(raw)}}
+        return [{"role": "assistant", "content": "", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": call_id, "content": json.dumps(flag)}]
+
+    def _with_clinical_ticket(state: CareFlowState, config: RunnableConfig, final: list[dict]) -> list[dict]:
+        """OP-CS-014 9.6: where a message triggers deflection, the system must create the Clinical Routing
+        Ticket automatically. If the answer deflects (or gives the emergency statement) and no clinical flag
+        was raised this turn, raise it here; the live golden run showed the model saying the script
+        without calling flag_for_human."""
+        answer = " ".join((final[-1].get("content") or "").split()).lower()
+        emergency = EMERGENCY_MARK in answer
+        if not (emergency or DEFLECTION_MARK in answer):
+            return final
+        raised = any(c["name"] == "flag_for_human" and c["result"].get("ok") and c["result"].get("category") == "clinical"
+                     for c in turn_tool_calls(state["messages"]))
+        if raised:
+            return final
+        urgency = "Emergent" if emergency else "Routine"
+        return [*_staff_flag(state, config, CLINICAL_TICKET_REASON, urgency, True, "ticket-1"), *final]
 
     def tools_node(state: CareFlowState, config: RunnableConfig) -> dict:
         out, update = [], {}
@@ -244,7 +332,7 @@ def build_agent_graph(
         return {}
 
     def after_model(state: CareFlowState) -> str:
-        return "tools" if state["messages"][-1].get("tool_calls") else "record"
+        return "ground" if state.get("draft") else "tools"
 
     def after_tools(state: CareFlowState) -> str:
         return "escalate" if state.get("steps", 0) >= max_steps else "memory"
@@ -254,10 +342,12 @@ def build_agent_graph(
     g.add_node("model", model_node)
     g.add_node("tools", tools_node)
     g.add_node("escalate", escalate_node)
+    g.add_node("ground", ground_node)
     g.add_node("record", record_node)
     g.add_edge(START, "memory")
     g.add_edge("memory", "model")
-    g.add_conditional_edges("model", after_model, {"tools": "tools", "record": "record"})
+    g.add_conditional_edges("model", after_model, {"tools": "tools", "ground": "ground"})
+    g.add_edge("ground", "record")
     g.add_conditional_edges("tools", after_tools, {"memory": "memory", "escalate": "escalate"})
     g.add_edge("escalate", "record")
     g.add_edge("record", END)

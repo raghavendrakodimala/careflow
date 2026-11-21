@@ -227,3 +227,17 @@ def test_a_conversation_is_one_contact_and_does_not_repeat_itself(store, mem):
     assert mem.recall(ref, exclude_thread="call-10")["repeat_topics"] == ["appointment_booking"]  # next call: REPEAT
     mem.record_turn(ref, [], thread_id="call-10")
     assert len(store.rows_for_patient("patient_interactions", ref)) == 2
+
+
+def test_policy_turn_summary_says_what_happened():  # feedback M4-1b
+    from careflow.memory import summarise_turn
+
+    def search(count):
+        return {"name": "search_policies", "arguments": {}, "result": {"ok": True, "count": count}}
+
+    flag = {"name": "flag_for_human", "arguments": {"reason": "x"},
+            "result": {"ok": True, "flag_id": "FLAG-0001", "urgency": "Routine", "category": "administrative"}}
+    assert summarise_turn([search(2)])["summary"] == "Asked about a clinic policy. Answered from the policy documents."
+    assert summarise_turn([search(0)])["summary"] == "Asked about a clinic policy. Not covered by the policy documents."
+    withheld = summarise_turn([search(2), flag])
+    assert "Answered" not in withheld["summary"] and withheld["outcome"] == "callback_scheduled"

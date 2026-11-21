@@ -31,15 +31,17 @@ def _model(steps):
     return fake, seen
 
 
-def test_graph_shape_is_memory_model_tools_escalate_record():
+def test_graph_shape_is_memory_model_tools_ground_escalate_record():
     g = build_agent_graph(Deps(tools=CareFlowTools(), model=lambda m, s: None))
     drawn = g.get_graph()
-    assert {"memory", "model", "tools", "escalate", "record"} <= set(drawn.nodes)
+    assert {"memory", "model", "tools", "ground", "escalate", "record"} <= set(drawn.nodes)
     edges = {(e.source, e.target) for e in drawn.edges}
     assert {
         ("__start__", "memory"), ("memory", "model"), ("model", "tools"), ("tools", "memory"),
-        ("tools", "escalate"), ("model", "record"), ("escalate", "record"), ("record", "__end__"),
+        ("tools", "escalate"), ("model", "ground"), ("ground", "record"), ("escalate", "record"),
+        ("record", "__end__"),
     } <= edges
+    assert ("model", "record") not in edges  # M4: no final answer skips the groundedness check
 
 
 def test_only_the_allowed_tool_subset_is_offered_and_enforced():

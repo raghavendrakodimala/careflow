@@ -77,7 +77,8 @@ class LiteLLMEmbedder:
         path = str(cache_path or EMBED_CACHE)
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # the cache database
+        self._pace_lock = threading.Lock()  # the rate-limit window and the call count (feedback M4-8)
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS vectors (key TEXT PRIMARY KEY, vec BLOB NOT NULL)")
 
@@ -91,7 +92,8 @@ class LiteLLMEmbedder:
         for attempt in range(self.retries + 1):
             self._pace(len(batch))
             try:
-                self.calls += 1
+                with self._pace_lock:
+                    self.calls += 1
                 resp = litellm.embedding(
                     model=self.model,
                     input=batch,
@@ -111,14 +113,16 @@ class LiteLLMEmbedder:
 
     def _pace(self, n_texts: int) -> None:
         """Keep under the provider's per-minute limit. Gemini counts every text in a batch as one request
-        (free tier: 100 per minute), so pacing is by texts, not by HTTP calls."""
-        now = time.monotonic()
-        self._sent = [(t, n) for t, n in self._sent if now - t < self.WINDOW_S]
-        used = sum(n for _, n in self._sent)
-        if self._sent and used + n_texts > self.texts_per_minute:
-            self._sleep(self.WINDOW_S - (now - self._sent[0][0]) + 1)
-            self._sent = []
-        self._sent.append((time.monotonic(), n_texts))
+        (free tier: 100 per minute), so pacing is by texts, not by HTTP calls. Held under a lock, so two
+        threads cannot both decide there is room in the same window."""
+        with self._pace_lock:
+            now = time.monotonic()
+            self._sent = [(t, n) for t, n in self._sent if now - t < self.WINDOW_S]
+            used = sum(n for _, n in self._sent)
+            if self._sent and used + n_texts > self.texts_per_minute:
+                self._sleep(self.WINDOW_S - (now - self._sent[0][0]) + 1)
+                self._sent = []
+            self._sent.append((time.monotonic(), n_texts))
 
     def _sleep(self, seconds: float) -> None:
         time.sleep(max(0.0, seconds))

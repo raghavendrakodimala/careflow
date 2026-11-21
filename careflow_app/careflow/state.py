@@ -20,3 +20,8 @@ class CareFlowState(TypedDict, total=False):
     # (so a booking made a minute ago is already in it). Never holds another patient's data.
     patient_memory: str | None
     channel: str  # contact channel recorded with the interaction (web_form, sms, email, phone)
+    # M4: the model's final answer waits here until the `ground` node checks it; only then is it (or a staff
+    # handoff in its place) added to messages. M8's guard node checks the same draft.
+    draft: dict | None
+    # M4: groundedness check of this turn's answer (grounding.GroundingResult.as_dict()); reset every turn.
+    grounding: dict

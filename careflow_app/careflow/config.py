@@ -47,6 +47,19 @@ class Settings(BaseSettings):
     # Gemini's free tier counts each embedded text as a request: 100 per minute. Stay under it.
     careflow_embedding_texts_per_minute: int = 90
 
+    # M4 retrieval. The index is built from the PDF copy of the corpus ("the PDF is what production looks
+    # like", toolkit README); "markdown" is the clean copy, used as the parity reference.
+    careflow_policy_source: str = "pdf"
+    # Local cross-encoder (sentence-transformers) that reranks the fused candidates; "none" switches it off.
+    careflow_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    # Abstain when the best reranked passage scores below this (probability, 0..1). Calibrated by
+    # scripts/run_m4_eval.py on answerable vs unanswerable questions.
+    # Offline calibration (hashing embedder): answerable min 0.314, unanswerable max 0.003 -> 0.03.
+    careflow_rerank_min_score: float = 0.03
+    careflow_retrieval_candidates: int = 20
+    # A Qdrant server URL (M6/M8: several processes share it); empty = local mode at out/qdrant.
+    careflow_qdrant_url: str = ""
+
     request_timeout_s: int = 90
     transport_retries: int = 3
 

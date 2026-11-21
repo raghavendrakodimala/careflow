@@ -1,4 +1,4 @@
-"""Structure-aware chunking of the policy corpus (markdown copy).
+"""Structure-aware chunking of the policy corpus (markdown copy, or the PDF copy read back by pdf_loader).
 
 Every heading starts a new section, and a chunk never crosses a section boundary. A long section is
 split between paragraphs (numbered clauses are paragraphs), never inside one, so a table or a clause
@@ -100,7 +100,11 @@ def _pieces(body: str, limit: int) -> list[str]:
     return pieces
 
 
-def chunk_document(slug: str, title: str, group: str, markdown: str, max_chars: int = MAX_CHARS) -> list[Chunk]:
+def chunk_document(
+    slug: str, title: str, group: str, markdown: str, max_chars: int = MAX_CHARS, source_format: str = "markdown"
+) -> list[Chunk]:
+    # The two copies get different IDs, so an index built from one never overwrites points of the other.
+    prefix = "" if source_format == "markdown" else f"{source_format}:"
     doc_id_match = _DOC_ID.search(markdown)
     doc_id = doc_id_match.group(1) if doc_id_match else None
     specialty = SPECIALTY_BY_SLUG.get(slug)
@@ -112,7 +116,7 @@ def chunk_document(slug: str, title: str, group: str, markdown: str, max_chars: 
             ordinal = len(chunks)
             chunks.append(
                 Chunk(
-                    chunk_id=str(uuid.uuid5(_NAMESPACE, f"{slug}#{ordinal}")),
+                    chunk_id=str(uuid.uuid5(_NAMESPACE, f"{prefix}{slug}#{ordinal}")),
                     doc_slug=slug,
                     doc_title=title,
                     doc_group=group,
@@ -123,17 +127,30 @@ def chunk_document(slug: str, title: str, group: str, markdown: str, max_chars: 
                     specialty=specialty,
                     procedure_codes=sorted(set(_PROC_CODE.findall(f"{heading}\n{piece}"))),
                     plan_codes=[p for p in PLAN_CODES if p in f"{heading}\n{piece}"],
+                    source_format=source_format,
                 )
             )
     return chunks
 
 
-def load_corpus_chunks(data_dir: Path | str | None = None, max_chars: int = MAX_CHARS) -> list[Chunk]:
-    """Chunk every document listed in corpus/index.json (markdown copies)."""
+SOURCES = ("markdown", "pdf")
+
+
+def load_corpus_chunks(
+    data_dir: Path | str | None = None, max_chars: int = MAX_CHARS, source: str = "markdown"
+) -> list[Chunk]:
+    """Chunk every document listed in corpus/index.json, from its markdown or its PDF copy."""
+    if source not in SOURCES:
+        raise ValueError(f"source must be one of {SOURCES}")
     root = Path(data_dir) if data_dir else DATA_DIR
     index = json.loads((root / "corpus" / "index.json").read_text(encoding="utf-8"))
     chunks: list[Chunk] = []
     for doc in index:
-        text = (root / doc["markdown"]).read_text(encoding="utf-8")
-        chunks.extend(chunk_document(doc["slug"], doc["title"], doc["section"], text, max_chars))
+        if source == "pdf":
+            from .pdf_loader import pdf_to_markdown  # pypdf is needed only for this path
+
+            text = pdf_to_markdown(root / doc["pdf"])
+        else:
+            text = (root / doc["markdown"]).read_text(encoding="utf-8")
+        chunks.extend(chunk_document(doc["slug"], doc["title"], doc["section"], text, max_chars, source))
     return chunks
