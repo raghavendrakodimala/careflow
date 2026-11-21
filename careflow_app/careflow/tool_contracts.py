@@ -47,7 +47,7 @@ class FindAppointmentSlotsInput(_Input):
     )
     mode: Literal["in_person", "telehealth"] | None = None
     earliest_date: str | None = Field(None, description="ISO date, e.g. 2026-08-05")
-    limit: int = Field(5, description="max slots, default 5")
+    limit: int = Field(5, ge=1, le=20, description="max slots, default 5")
     patient_ref: str | None = None
     new_patient: bool | None = Field(None, description="override: true for a patient new to the clinic")
 
@@ -69,6 +69,12 @@ class CalculateCopayInput(_Input):
     patient_ref: str | None = None
     procedure_code: str = Field(description="e.g. GAST-COLO, CARD-CONS")
     telehealth: bool = Field(False, description="true for a telehealth consultation")
+    # M4: a what-if estimate when there is no patient record to use ("a patient on MERIDIAN-SILVER who has
+    # met $500 of the deductible"). Ignored when patient_ref is given: the patient's own record is used.
+    plan_code: str | None = Field(None, description="plan for an estimate without a patient_ref, e.g. MERIDIAN-SILVER")
+    deductible_met_usd: float | None = Field(
+        None, ge=0, description="deductible already met this year, for an estimate without a patient_ref"
+    )
 
 
 class FlagForHumanInput(_Input):
@@ -89,11 +95,16 @@ class FindPatientInput(_Input):
 
 
 class SearchPoliciesInput(_Input):
-    query: str = Field(description="the policy or coverage question, in plain words")
+    # Bounded, and generic: the query goes to the embedding API (feedback M4-7, data-handling standard).
+    query: str = Field(
+        min_length=1, max_length=500,
+        description="the policy or coverage question in plain, generic words; never a patient's name, "
+        "date of birth, patient_ref or member number",
+    )
     specialty: Specialty | None = Field(
         None, description="set only for a question about one specialty's service line handbook"
     )
-    limit: int = Field(4, description="max passages, default 4")
+    limit: int = Field(4, ge=1, le=8, description="max passages, default 4")
 
 
 @dataclass(frozen=True)
@@ -161,7 +172,8 @@ TOOLS: tuple[ToolDefinition, ...] = (
         "calculate_copay",
         "Work out what the patient owes for a procedure under their plan. If insurance cannot be used "
         "(no insurance, coverage not active, procedure not covered) it gives the self-pay price instead. "
-        "Leave out patient_ref for a patient with no insurance.",
+        "Leave out patient_ref for a patient with no insurance. For someone with no patient_ref (a what-if "
+        "question), pass plan_code and deductible_met_usd for an estimate.",
         CalculateCopayInput,
         idempotent=True,
     ),
@@ -183,7 +195,8 @@ TOOLS: tuple[ToolDefinition, ...] = (
         "search_policies",
         "Search the clinic's policy and insurance documents (referral policy, pre-authorisation matrix, "
         "cost-share schedule, intake SOP, data handling, specialty handbooks) for rules, preparation "
-        "instructions, timings and coverage terms. Returns passages with their document title.",
+        "instructions, timings and coverage terms. Returns passages with their document title, or none when "
+        "the documents do not cover the question.",
         SearchPoliciesInput,
         idempotent=True,
     ),

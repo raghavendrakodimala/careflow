@@ -6,3 +6,5 @@ pydantic-settings>=2.2
 pytest
 tenacity
 qdrant-client>=1.12
+pypdf>=5
+sentence-transformers>=3

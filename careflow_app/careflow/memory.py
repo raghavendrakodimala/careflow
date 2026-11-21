@@ -42,7 +42,7 @@ TOPIC_SUMMARY = {
     "referral_status": "Asked for the status of a referral.",
     "billing_question": "Queried a co-pay or an amount on a statement.",
     "eligibility_check": "Asked whether their plan is active and what it covers.",
-    "policy_question": "Asked about a clinic policy; answered from the policy documents.",
+    "policy_question": "Asked about a clinic policy.",
     "general_enquiry": "Contacted the clinic about their records.",
 }
 TOPIC_RANK = list(TOPIC_SUMMARY)  # earlier = more significant when one contact covers several turns
@@ -261,6 +261,12 @@ def summarise_turn(tool_calls: list[dict], answer: str = "", own_referrals: set[
         if c["name"] == "book_appointment":
             b = c["result"]
             details.append(f"Booked {b.get('appointment_id')} for {b.get('starts_at')} ({b.get('payment')}).")
+    if topic == "policy_question":  # feedback M4-1: say what actually happened, not "answered"
+        found = any((c["result"].get("count") or 0) > 0 for c in ok if c["name"] == "search_policies")
+        if not found:
+            details.append("Not covered by the policy documents.")
+        elif not flags:
+            details.append("Answered from the policy documents.")
     for c in flags:
         kind = "clinical" if c in clinical else "staff"
         details.append(f"{kind.capitalize()} flag {c['result'].get('flag_id')} ({c['result'].get('urgency')}).")

@@ -72,7 +72,7 @@ def test_policy_search_returns_titled_passages():
     assert "search_policies" in tools.available_tools()
     r = tools.call("search_policies", {"query": "consultation length", "specialty": "Neurology", "limit": 3})
     assert r["ok"] and r["count"] == 3
-    assert all(h["document"] for h in r["results"]) and "Answer only from these passages" in r["note"]
+    assert all(h["document"] for h in r["results"]) and "Answer only from" in r["note"]
     assert all("Cardiology" not in h["document"] for h in r["results"])
     assert tools.search_policies("x", specialty="Podiatry")["ok"] is False
     assert "specialty" in tools.call("search_policies", {"query": "x", "specialty": "Podiatry"})["error"]

@@ -17,7 +17,7 @@ LAYERS = {
     "domain": 0,                                      # pure rules, standard library only
     "config": 1, "schemas": 1, "prompts": 1, "state": 1,
     "store": 2, "llm_client": 2, "tool_contracts": 2, "rag": 2,
-    "memory": 3, "intake": 3, "tools": 3,              # framework-neutral services and tools
+    "memory": 3, "intake": 3, "tools": 3, "grounding": 3,  # framework-neutral services and tools
     "graph": 4,
     "agent": 5,
     # Reserved for later milestones (a layer is needed before the package can exist):
@@ -25,7 +25,7 @@ LAYERS = {
 }
 # The tool, memory, store and retrieval layers stay framework-neutral so M6's MCP server can wrap them.
 NO_LANGGRAPH = {"domain", "config", "schemas", "prompts", "store", "llm_client", "tool_contracts", "rag",
-                "memory", "intake", "tools"}
+                "memory", "intake", "tools", "grounding"}
 
 
 def _modules():

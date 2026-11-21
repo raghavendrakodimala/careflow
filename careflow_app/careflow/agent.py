@@ -34,6 +34,7 @@ class AgentResult:
     steps: int = 0
     stopped_early: bool = False  # hit the step cap without a final answer
     patient_ref: str | None = None  # verified patient for the thread after this turn
+    grounding: dict = field(default_factory=dict)  # M4: groundedness check of this answer (graph `ground` node)
 
     @property
     def tools_used(self) -> list[str]:
@@ -89,6 +90,8 @@ def run_agent(
         "steps": 0,
         "escalated": False,
         "channel": channel,
+        "draft": None,
+        "grounding": {},
     }
     if patient_ref:  # only set it when given, so a patient verified earlier on the thread is kept
         turn["patient_ref"] = patient_ref
@@ -100,6 +103,7 @@ def run_agent(
         steps=state.get("steps", 0),
         stopped_early=bool(state.get("escalated")),
         patient_ref=state.get("patient_ref"),
+        grounding=state.get("grounding") or {},
     )
 
 
