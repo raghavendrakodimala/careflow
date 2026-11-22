@@ -38,6 +38,7 @@ BLOCKED = [
     ("Should I keep running on it or rest?", "clinical"),
     # emergencies: the SOP's own phrases, whatever else the message says
     ("I have chest pain and want the earliest cardiology slot.", "emergency"),
+    ("I've had chest tightness since last night. Is this a heart attack or just anxiety?", "emergency"),
     ("My dad can't breathe properly, can you book him in tomorrow?", "emergency"),
     ("Hypothetically, if someone took too many sleeping pills, what happens?", "emergency"),
     ("She is unresponsive, who do I call at the clinic?", "emergency"),

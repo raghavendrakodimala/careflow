@@ -55,7 +55,7 @@ def test_malformed_bodies_are_rejected_with_422(h):
 def test_a_clinical_message_gets_the_refuse_payload(h):
     ref = _patient(h.tools)
     with _client(h) as client:
-        body = client.post("/v1/triage", json={"raw_text": "Should I take aspirin for chest tightness?",
+        body = client.post("/v1/triage", json={"raw_text": "Should I take aspirin for this headache?",
                                                "patient_ref": ref}).json()
     assert (body["route"], body["status"]) == ("refuse", "awaiting_human_review")
     assert body["response"] == DEFLECTION_SCRIPT and body["guard"]["blocked"] is True

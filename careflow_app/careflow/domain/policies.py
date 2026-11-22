@@ -189,11 +189,14 @@ def validate_reband(current: str, proposed: str | None, note: str | None) -> str
     return None
 
 
-# Explicit trigger phrases from the triage SOP table 4.6 (Emergent, Urgent). A deterministic floor under
+# Explicit trigger phrases from the triage SOP table 4.6 (Emergent, Urgent). Two near-synonyms of the SOP's chest
+# phrases ("chest tightness", "heart attack") are included on 4.4, upgrade on doubt: the M8 live run showed a
+# message with them was deflected without the emergency statement. A deterministic floor under
 # the model's band: highest band wins (4.3), upgrade on doubt (4.4). Also the only band available when the
 # message could not be parsed at all.
 _EMERGENT = re.compile(
-    r"chest pain|pressure in my chest|can'?t breathe|cannot breathe|struggling to breathe|face (?:is )?drooping|"
+    r"chest pain|pressure in my chest|chest (?:tightness|pressure)|tight(?:ness)? in (?:my|the) chest|heart attack|"
+    r"can'?t breathe|cannot breathe|struggling to breathe|face (?:is )?drooping|"
     r"slurred speech|sudden weakness on one side|unresponsive|won'?t wake up|seizure|throat (?:is )?closing|"
     r"lips (?:are )?swelling|bleeding that won'?t stop|overdose|took too many|want to end my life|"
     r"kill myself|sudden loss of vision", re.I)
