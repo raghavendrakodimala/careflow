@@ -20,8 +20,9 @@ LAYERS = {
     "memory": 3, "intake": 3, "tools": 3, "grounding": 3,  # framework-neutral services and tools
     "graph": 4,
     "agent": 5,
+    "agents": 6,                                      # M6: the team, built on the single agent
     # Reserved for later milestones (a layer is needed before the package can exist):
-    "workflows": 6, "mcp": 6, "api": 7,
+    "mcp": 6, "workflows": 7, "api": 8,
 }
 # The tool, memory, store and retrieval layers stay framework-neutral so M6's MCP server can wrap them.
 NO_LANGGRAPH = {"domain", "config", "schemas", "prompts", "store", "llm_client", "tool_contracts", "rag",

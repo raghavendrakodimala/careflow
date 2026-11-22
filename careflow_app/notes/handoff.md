@@ -163,6 +163,23 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
   - The topic of a non-clinical message is inferred from keywords (`policies.intake_topic`); anything unmatched counts as an appointment request.
   - Trigger-phrase matching has no negation handling: "no chest pain" is banded Emergent (SOP 4.4, upgrade on doubt).
 
+## M6 status: agent team and EHR MCP server (branch feat/krp-milestone6)
+- **Plan:** `notes/plan.md` covers M6, M7 and M8 and the three stacked branches. Owner decisions of 2026-11-22: local traces plus a LangFuse exporter; commit each milestone locally on its own branch, no push; six extra refusal cases under `careflow_app`.
+- **MCP server** (`careflow/mcp/server.py`, `python -m careflow.mcp`, stdio): serves `find_appointment_slots`, `book_appointment`, `check_eligibility`, `check_preauth`, `find_patient`. Each is the same `CareFlowTools.call()`; names, descriptions and schemas come from `tool_contracts.TOOLS`. It opens the shared runtime store (`CAREFLOW_RUNTIME_DB`), so a booking is visible to both processes.
+- **MCP client** (`careflow/mcp/client.py`): `McpRoutedTools(local_tools)` sends those five tools to the server and everything else to the local object. The graph and workflow are unchanged because they only use `deps.tools`. It needs a file-backed store.
+- **Agents** (`careflow/agents.py`): Intake (M1 `parse_intake`, the workflow's `intake` node), Insurance, Referral Tracker, Clinical Safety Reviewer. The two specialists are the existing agent graph with their own prompt and tool subset (`run_agent` gained `system_prompt`). `specialists_for(message)` picks them in code from the wording; a message needing both runs Insurance first, then the Referral Tracker with that answer.
+- **Clinical Safety Reviewer:** a structured verdict (`SafetyVerdict`) from `complete_structured`. A veto, or any failure to get a verdict, replaces the reply with the deflection script and raises a clinical ticket.
+- **Workflow:** `assist` is now `team` followed by `safety_review`. A veto makes the route `refuse`. `TriageDeps.review` holds the reviewer; `None` (the tests' default) skips the review.
+- **Layers** (`tests/test_architecture.py`): `agents` and `mcp` at 6, `workflows` at 7, `api` reserved at 8.
+- **`mcp` 2.3.0 installed on Python 3.15.2.** It is the 2.x API (`Server(on_list_tools=..., on_call_tool=...)`, `Client(StdioServerParameters)`), not the 1.x `FastMCP`.
+- Offline tests: **402 passing** (`test_mcp.py` starts the real server as a child process; `test_agents.py`). Validator READY; `data/` unchanged.
+- **Not run yet (LIVE, needs the owner's go-ahead):** `python -m scripts.run_m6_demo`, about 25 chat calls. `scripts.run_m5_demo` is also still not run.
+- **Limits to know:**
+  - The specialist is chosen by keywords. Anything that mentions no booking or referral word goes to Insurance, which holds the policy search.
+  - The reviewer costs one extra model call per reply, and when the model is unavailable every reply is withheld (fail closed).
+  - The MCP server uses the frozen clock, like the rest of the app.
+  - The chat path (`run_agent`) still uses the single agent; `run_team` is the team entry point that M8's API will call.
+
 ## Next steps
 1. Owner: approve the live M2 demo run; decide whether to tune the urgency prompt; decide on the `pending_verification` booking rule.
 2. Optional: show the client is provider-agnostic by running 5 records on OpenRouter (the key is in the toolkit `.env`; model and cost not yet checked). Ollama is not installed.
@@ -170,7 +187,7 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
    - M3: session memory = graph `thread_id` + checkpointer; long-term memory = a node before `model` reading `patient_interactions` and `appointments` from the runtime store; Qdrant index over the corpus.
    - M4: RAG with hybrid search and reranking; groundedness evaluation.
    - M5: done (see M5 status).
-   - M6: multi-agent team; mock EHR exposed as an MCP server.
+   - M6: done (see M6 status).
    - M7: LangFuse tracing; retries, fallbacks, circuit breaker.
    - M8: guardrails against clinical advice, golden-set run, FastAPI service.
 4. Slides (PDF) and the demo video.

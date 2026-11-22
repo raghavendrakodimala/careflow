@@ -23,7 +23,8 @@ class TriageState(TypedDict, total=False):
     route: str              # auto | human_review | refuse
     reasons: list[str]
     response: str           # what the patient is told
-    agent: dict             # summary of the assistant sub-step (tools used, flags, grounding)
+    agent: dict             # summary of the team step (specialists, tools used, flags, grounding)
+    verdict: dict | None    # the Clinical Safety Reviewer's verdict on the reply (M6)
     flag_id: str | None
     review_id: str | None
     decision: dict | None   # the staff decision (ReviewDecision) once given

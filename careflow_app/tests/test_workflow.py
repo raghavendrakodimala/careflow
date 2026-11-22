@@ -89,14 +89,14 @@ def test_graph_has_the_planned_nodes():
     assert set(NODES) <= set(graph.nodes)
     edges = {(e.source, e.target) for e in graph.edges}
     assert {("intake", "hydrate"), ("hydrate", "deflect"), ("hydrate", "eligibility"), ("eligibility", "routing"),
-            ("routing", "assist"), ("assist", "decide"), ("deflect", "decide"), ("decide", "review"),
+            ("routing", "team"), ("team", "safety_review"), ("safety_review", "decide"), ("deflect", "decide"), ("decide", "review"),
             ("decide", "finalize"), ("review", "finalize")} <= edges
 
 
 def test_auto_request_runs_the_steps_in_order_and_completes():
     h = Harness()
     r = h.start(_patient(h.tools))
-    assert r.steps == ["intake", "hydrate", "eligibility", "routing", "assist", "decide", "finalize"]
+    assert r.steps == ["intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]
     assert (r.status, r.route, r.reasons) == ("completed", "auto", [])
     assert r.response == "Here is what I found."
     assert r.review_id is None and h.tools.flags == [] and h.tools.store.pending_reviews() == []
