@@ -2,13 +2,14 @@
 
     START -> intake -> hydrate --(clinical / Emergent / intake failed)--> deflect ------+
                           |                                                             v
-                          +-> eligibility -> routing -> assist ---------------------> decide
+                          +-> eligibility -> routing -> team -> safety_review ------> decide
                                                                                         |
                                                  (auto) finalize <----------------------+--> review -> finalize -> END
 
 The order of the steps is fixed here, not chosen by the model. The model is used in two places only:
-parsing the message (intake) and writing the reply (assist, the existing agent graph with its tools,
-grounding check and clinical-ticket rule).
+parsing the message (intake, the Intake agent) and writing the reply (team: the Insurance and Referral
+Tracker specialists from agents.py, each the existing agent graph with its own prompt and tools). M6
+adds `safety_review`: the Clinical Safety Reviewer reads the reply and can veto it (fail closed).
 
 Human review (owner decision 2026-11-21, "act, then pause"): OP-CS-014 6.1, 8.1 and 9.6 allow no delay
 to the deflection script, the emergency statement or the Clinical Routing Ticket, so those go out
@@ -37,7 +38,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from ..agent import run_agent
+from ..agents import Reviewer, default_reviewer, review_reply, run_specialists, withhold
 from ..config import Settings
 from ..domain import policies
 from ..graph import CLINICAL_TICKET_REASON, ESCALATION_ANSWER, ESCALATION_REASON, GROUNDING_REASON, Deps
@@ -51,10 +52,12 @@ from .state import ReviewDecision, TriageState
 HANDOFF_ANSWER = "Your request has been passed to our staff, who will contact you."
 INTAKE_FAILED = "Message could not be read automatically: failed closed and routed to a clinician (OP-CS-014 9.3)"
 ASSISTANT_DEFLECTED = "The assistant deflected a clinical question (OP-CS-014 5.1)"
+REVIEWER_WITHHELD = "The Clinical Safety Reviewer withheld the reply (OP-CS-014 9.6)"
 REVIEW_REASON = "Triage review needed"
 CLINICAL_ISSUE = "clinical_question"
 LIVE_REFERRAL = ("open", "accepted", "scheduled")
-NODES = ("intake", "hydrate", "deflect", "eligibility", "routing", "assist", "decide", "review", "finalize")
+NODES = ("intake", "hydrate", "deflect", "eligibility", "routing", "team", "safety_review", "decide", "review",
+         "finalize")
 
 
 @dataclass
@@ -62,8 +65,9 @@ class TriageDeps:
     """Everything the workflow needs from outside (the seam for tests and M7 hardening)."""
 
     agent: Deps                               # tools, model and memory, shared with the assistant sub-step
-    parse: Callable[[dict], PatientRequest]   # M1 intake parser
+    parse: Callable[[dict], PatientRequest]   # M1 intake parser (the Intake agent)
     settings: Settings | None = None
+    review: Reviewer | None = None            # M6 Clinical Safety Reviewer; None = replies are not reviewed
 
     @property
     def tools(self) -> CareFlowTools:
@@ -76,7 +80,7 @@ class TriageDeps:
     @classmethod
     def default(cls, tools: CareFlowTools | None = None, settings: Settings | None = None) -> TriageDeps:
         return cls(agent=Deps.default(tools, settings), parse=lambda record: parse_intake(record, settings),
-                   settings=settings)
+                   settings=settings, review=default_reviewer(settings))
 
 
 def _thread(config: RunnableConfig) -> str:
@@ -223,31 +227,49 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         return {"band": band, "plan": plan, "route": route, "reasons": reasons,
                 "audit": audit("routing", route=route, referral_id=(referral or {}).get("referral_id"))}
 
-    def assist_node(state: TriageState, config: RunnableConfig) -> dict:
-        """The reply, written by the existing agent. Booking is withheld when staff must decide first."""
+    def team_node(state: TriageState, config: RunnableConfig) -> dict:
+        """The reply, written by the specialists the message needs (agents.specialists_for). Booking is
+        withheld from all of them when staff must decide first."""
         if not state.get("answer", True):
             return {"agent": {}}
-        names = tools.available_tools()
-        if state["route"] != policies.ROUTE_AUTO:
-            names = names - {"book_appointment"}
+        withheld = {"book_appointment"} if state["route"] != policies.ROUTE_AUTO else set()
         try:
-            r = run_agent(state["record"]["raw_text"], deps=deps.agent, patient_ref=state.get("patient_ref"),
-                          channel=channel(state), tool_names=names, thread_id=_thread(config))
+            team = run_specialists(state["record"]["raw_text"], deps.agent, patient_ref=state.get("patient_ref"),
+                                   channel=channel(state), thread_id=_thread(config), withheld=withheld)
         except Exception as exc:  # the model is down: hand to staff, never guess
             return {"agent": {"error": type(exc).__name__}, "response": ESCALATION_ANSWER,
-                    "audit": audit("assist", error=type(exc).__name__)}
-        flags = [c["result"] for c in r.tool_calls if c["name"] == "flag_for_human" and c["result"].get("ok")]
-        searches = [c["result"] for c in r.tool_calls if c["name"] == "search_policies"]
+                    "audit": audit("team", error=type(exc).__name__)}
+        flags = [c["result"] for c in team.tool_calls if c["name"] == "flag_for_human" and c["result"].get("ok")]
+        searches = [c["result"] for c in team.tool_calls if c["name"] == "search_policies"]
         summary = {
-            "tools_used": r.tools_used, "tools_offered": sorted(names), "stopped_early": r.stopped_early,
+            "agents": team.agents, "tools_used": team.tools_used,
+            "tools_offered": sorted(tools.available_tools() - withheld), "stopped_early": team.stopped_early,
             "flags": [{"flag_id": f["flag_id"], "category": f.get("category"), "urgency": f["urgency"],
                        # raised by the graph itself (step cap, withheld answer), not asked for by the model
                        "automatic": any(mark in f["reason"] for mark in (ESCALATION_REASON, GROUNDING_REASON))}
                       for f in flags],
-            "ungrounded": bool(r.grounding.get("checked") and not r.grounding.get("grounded")),
+            "ungrounded": team.ungrounded,
             "nothing_found": bool(searches) and all(s.get("abstained") or not s.get("count") for s in searches),
         }
-        return {"agent": summary, "response": r.answer, "audit": audit("assist", tools=r.tools_used)}
+        return {"agent": summary, "response": team.answer,
+                "audit": audit("team", agents=team.agents, tools=team.tools_used)}
+
+    def safety_review_node(state: TriageState, config: RunnableConfig) -> dict:
+        """The Clinical Safety Reviewer. A veto, or no verdict, replaces the reply with the deflection
+        script and raises a Clinical Routing Ticket (fail closed, OP-CS-014 9.3 and 9.6)."""
+        agent = state.get("agent") or {}
+        if not agent or agent.get("error"):
+            return {}  # nothing was written by the team
+        verdict = review_reply(state["record"]["raw_text"], state.get("response") or "", deps.review)
+        if verdict.safe:
+            return {"verdict": verdict.model_dump(), "audit": audit("safety_review", safe=True)}
+        ticket = withhold(deps.agent, state.get("patient_ref"), _thread(config), urgency=state["band"])
+        flags = [*(agent.get("flags") or []),
+                 {"flag_id": ticket.get("flag_id"), "category": "clinical", "urgency": ticket.get("urgency") or state["band"],
+                  "automatic": True}]
+        return {"verdict": verdict.model_dump(), "response": DEFLECTION_SCRIPT,
+                "agent": {**agent, "flags": flags, "vetoed": True},
+                "audit": audit("safety_review", safe=False, category=verdict.category, flag_id=ticket.get("flag_id"))}
 
     def decide_node(state: TriageState, config: RunnableConfig) -> dict:
         """The final route. A non-auto route always has a staff flag and a review request before the pause,
@@ -261,7 +283,8 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         if not deflected:
             clinical = [f for f in flags if f["category"] == "clinical"]
             if clinical:  # a refusal is only a refusal: the administrative reasons no longer apply
-                route, adopted, reasons = policies.ROUTE_REFUSE, clinical[0]["flag_id"], [ASSISTANT_DEFLECTED]
+                why = REVIEWER_WITHHELD if agent.get("vetoed") else ASSISTANT_DEFLECTED
+                route, adopted, reasons = policies.ROUTE_REFUSE, clinical[-1]["flag_id"], [why]
             else:
                 if agent.get("error"):
                     reasons.append("The assistant was unavailable")
@@ -322,16 +345,17 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
 
     g = StateGraph(TriageState)
     for name, fn in (("intake", intake_node), ("hydrate", hydrate_node), ("deflect", deflect_node),
-                     ("eligibility", eligibility_node), ("routing", routing_node), ("assist", assist_node),
-                     ("decide", decide_node), ("review", review_node), ("finalize", finalize_node)):
+                     ("eligibility", eligibility_node), ("routing", routing_node), ("team", team_node),
+                     ("safety_review", safety_review_node), ("decide", decide_node), ("review", review_node), ("finalize", finalize_node)):
         g.add_node(name, fn)
     g.add_edge(START, "intake")
     g.add_edge("intake", "hydrate")
     g.add_conditional_edges("hydrate", after_hydrate, {"deflect": "deflect", "eligibility": "eligibility"})
     g.add_edge("deflect", "decide")
     g.add_edge("eligibility", "routing")
-    g.add_edge("routing", "assist")
-    g.add_edge("assist", "decide")
+    g.add_edge("routing", "team")
+    g.add_edge("team", "safety_review")
+    g.add_edge("safety_review", "decide")
     g.add_conditional_edges("decide", after_decide, {"finalize": "finalize", "review": "review"})
     g.add_edge("review", "finalize")
     g.add_edge("finalize", END)

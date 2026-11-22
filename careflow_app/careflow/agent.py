@@ -71,19 +71,22 @@ def run_agent(
     channel: str = "web_form",
     deps: Deps | None = None,
     tool_names: set[str] | None = None,
+    system_prompt: str | None = None,
 ) -> AgentResult:
     """Answer one request.
 
     `patient_ref`, if the caller has already verified it (an authenticated channel), is the thread's
     patient; otherwise the agent identifies the caller with find_patient. `model` replaces the LLM call
     (tests). `deps` replaces all dependencies (e.g. memory=None to switch long-term memory off). `tool_names`
-    limits the tools offered (M5 withholds booking while a case waits for staff).
+    limits the tools offered (M5 withholds booking while a case waits for staff). `system_prompt`
+    replaces the default prompt (M6: one prompt per specialist).
     """
     patient_ref = str(patient_ref).strip().upper() or None if patient_ref else None
     deps = deps or Deps.default(tools, settings)
     if model is not None:
         deps.model = model
-    graph = build_agent_graph(deps, tool_names=tool_names, checkpointer=checkpointer, max_steps=max_steps)
+    graph = build_agent_graph(deps, system_prompt or SYSTEM_PROMPT, tool_names=tool_names,
+                              checkpointer=checkpointer, max_steps=max_steps)
 
     context = f"\n\n(Caller context: patient_ref={patient_ref})" if patient_ref else ""
     # One contact = one conversation (thread). Without a checkpointer each call is its own contact, so it

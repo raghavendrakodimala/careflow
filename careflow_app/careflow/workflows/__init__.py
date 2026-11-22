@@ -51,6 +51,7 @@ class TriageResult:
     eligibility: dict = field(default_factory=dict)
     plan: dict = field(default_factory=dict)
     agent: dict = field(default_factory=dict)
+    verdict: dict | None = None
     flag_id: str | None = None
     review_id: str | None = None
     decision: dict | None = None
@@ -67,6 +68,7 @@ def _result(thread_id: str, values: dict) -> TriageResult:
         reasons=values.get("reasons") or [], response=values.get("response") or "",
         band=values.get("band") or "Routine", patient_ref=values.get("patient_ref"),
         eligibility=values.get("eligibility") or {}, plan=values.get("plan") or {}, agent=values.get("agent") or {},
+        verdict=values.get("verdict"),
         flag_id=values.get("flag_id"), review_id=values.get("review_id"), decision=values.get("decision"),
         audit=values.get("audit") or [],
     )
@@ -93,7 +95,7 @@ def start_triage(record: dict, deps: TriageDeps | None = None, checkpointer: Any
     fresh: TriageState = {
         "record": {k: record[k] for k in RECORD_KEYS if k in record}, "answer": answer, "intake": {},
         "patient_ref": None, "band": "Routine", "repeat": None, "topic": "", "eligibility": {}, "plan": {},
-        "route": "", "reasons": [], "response": "", "agent": {}, "flag_id": None, "review_id": None,
+        "route": "", "reasons": [], "response": "", "agent": {}, "verdict": None, "flag_id": None, "review_id": None,
         "decision": None, "status": "running",
     }
     graph.invoke(fresh, _config(thread_id))

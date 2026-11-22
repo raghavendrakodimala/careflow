@@ -8,3 +8,4 @@ tenacity
 qdrant-client>=1.12
 pypdf>=5
 sentence-transformers>=3
+mcp>=2
