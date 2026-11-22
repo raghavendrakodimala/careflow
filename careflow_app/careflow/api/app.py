@@ -10,7 +10,8 @@
     POST /v1/chat                            one conversational turn with the agent team
 
 Resources are opened once at start-up (runtime store, session checkpointer, the EHR MCP server, the
-policy index if it has been built, the tracer) and closed at shutdown. Tests pass their own through
+policy index if it has been built, the tracer, and the local input-gate classifier, which is loaded and
+warmed so the first message is not the slow one) and closed at shutdown. Tests pass their own through
 create_app(), so no model, index or child process is needed.
 
 Access: if CAREFLOW_API_KEY is set, every /v1 request must send it as X-API-Key. This service has no
@@ -20,6 +21,7 @@ portal session, a staff console); a caller without one is identified from full n
 
 from __future__ import annotations
 
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -28,15 +30,26 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..agent import close_checkpointer, session_checkpointer
+from ..agent import PatientMismatch, close_checkpointer, session_checkpointer
 from ..agents import Reviewer, run_team
 from ..config import Settings, get_settings
-from ..guardrails import Classifier, default_classifier
+from ..guard_model import build_classifier
+from ..guardrails import Classifier
 from ..schemas import Channel
 from ..store import RuntimeStore
 from ..tools import CareFlowTools
 from ..workflows import (AlreadyTriaged, NotAwaitingReview, ReviewDecision, TriageDeps, pending_review, resume_triage,
                          start_triage)
+
+# Chat sessions and triage cases share one checkpoint store with different state shapes. A chat thread
+# is stored under this prefix and a triage or review request may not use it, so neither can read the other.
+CHAT_PREFIX = "chat:"
+
+
+def _not_a_chat_thread(thread_id: str | None) -> None:
+    if thread_id and thread_id.lower().startswith(CHAT_PREFIX):
+        raise HTTPException(status_code=422, detail=f"thread_id may not start with {CHAT_PREFIX!r}")
+
 
 UNAVAILABLE = "The assistant cannot answer right now. Your message has not been lost; please try again shortly or call the clinic."
 
@@ -104,8 +117,32 @@ def default_resources(settings: Settings | None = None) -> Resources:
             tools = McpRoutedTools(tools)
         except Exception:
             pass  # the server could not start: the same tools run in-process
-    return Resources(TriageDeps.default(tools, settings), session_checkpointer(), default_classifier(settings),
-                     settings, owned=True)
+    classifier = build_classifier(settings)
+    warm = getattr(classifier, "warm", None)
+    if warm:  # load the local model now: a first message that waited for it would time out and be refused
+        try:
+            warm()
+        except Exception:
+            pass  # /health reports it; every message is then refused by the gate (fail closed)
+    return Resources(TriageDeps.default(tools, settings), session_checkpointer(), classifier, settings, owned=True)
+
+
+def _classifier_state(classifier) -> str:
+    """none | hosted | local:ready | local:not loaded, for /health."""
+    if classifier is None:
+        return "none"
+    if not hasattr(classifier, "warm"):
+        return "hosted"
+    return "local:ready" if getattr(classifier, "_weights", None) is not None else "local:not loaded"
+
+
+def _backends(tools) -> dict:
+    """For /health: is the EHR served over MCP (start-up falls back to in-process tools if the server will
+    not start), and the state of each circuit breaker."""
+    client = getattr(getattr(tools, "inner", tools), "client", None)
+    thread = getattr(client, "_thread", None)
+    mcp = "off" if client is None else ("running" if thread is None or thread.is_alive() else "stopped")
+    return {"mcp": mcp, "breakers": {name: b.state for name, b in (getattr(tools, "breakers", None) or {}).items()}}
 
 
 def _triage_payload(result) -> dict:
@@ -131,7 +168,8 @@ def create_app(resources: Resources | None = None) -> FastAPI:
 
     def authorised(request: Request, x_api_key: str | None = Header(default=None)) -> None:
         settings = res(request).settings or get_settings()
-        if settings.careflow_api_key and x_api_key != settings.careflow_api_key:
+        if settings.careflow_api_key and not secrets.compare_digest(
+                (x_api_key or "").encode(), settings.careflow_api_key.encode()):
             raise HTTPException(status_code=401, detail="missing or wrong X-API-Key")
 
     @app.get("/health")
@@ -144,11 +182,13 @@ def create_app(resources: Resources | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=f"not ready: {type(exc).__name__}") from exc
         return {"status": "ok", "patients": patients, "pending_reviews": len(r.deps.tools.store.pending_reviews()),
                 "policy_search": "search_policies" in r.deps.tools.available_tools(),
-                "tracing": r.deps.agent.tracer.enabled}
+                "tracing": r.deps.agent.tracer.enabled, "guard_classifier": _classifier_state(r.classifier),
+                **_backends(r.deps.tools)}
 
     @app.post("/v1/triage", dependencies=[Depends(authorised)])
     def triage(body: TriageRequest, request: Request) -> dict:
         r = res(request)
+        _not_a_chat_thread(body.thread_id)
         record = {"channel": body.channel, "received_at": body.received_at or r.deps.tools.clock.now().isoformat(),
                   "raw_text": body.raw_text, "patient_ref": body.patient_ref}
         try:
@@ -165,6 +205,7 @@ def create_app(resources: Resources | None = None) -> FastAPI:
     @app.get("/v1/reviews/{thread_id}", dependencies=[Depends(authorised)])
     def review(thread_id: str, request: Request) -> dict:
         r = res(request)
+        _not_a_chat_thread(thread_id)
         payload = pending_review(thread_id, r.deps, r.checkpointer)
         if payload is None:
             raise HTTPException(status_code=404, detail="no case is waiting for review on this thread")
@@ -173,6 +214,7 @@ def create_app(resources: Resources | None = None) -> FastAPI:
     @app.post("/v1/reviews/{thread_id}/decision", dependencies=[Depends(authorised)])
     def decide(thread_id: str, body: ReviewDecision, request: Request) -> dict:
         r = res(request)
+        _not_a_chat_thread(thread_id)
         try:
             result = resume_triage(thread_id, body, r.deps, r.checkpointer)
         except NotAwaitingReview as exc:
@@ -189,9 +231,13 @@ def create_app(resources: Resources | None = None) -> FastAPI:
         try:
             team = run_team(
                 body.message, r.deps.agent, r.reviewer, patient_ref=body.patient_ref, channel=body.channel,
-                thread_id=thread_id, checkpointer=r.checkpointer if body.thread_id else None, guard=True,
+                # Always stored, also when the caller sent no thread_id: the id returned below must lead
+                # back to this turn, or a caller identified here would have to identify again.
+                thread_id=CHAT_PREFIX + thread_id, checkpointer=r.checkpointer, guard=True,
                 classifier=r.classifier, guard_time_limit_s=settings.careflow_guard_timeout_s,
             )
+        except PatientMismatch as exc:
+            raise HTTPException(status_code=409, detail="this conversation belongs to another patient; start a new one") from exc
         except Exception as exc:  # the model is down: say so, never guess
             raise HTTPException(status_code=503, detail=UNAVAILABLE) from exc
         return {"thread_id": thread_id, "answer": team.answer, "route": team.route, "agents": team.agents,

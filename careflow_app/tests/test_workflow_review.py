@@ -9,7 +9,7 @@ from careflow.prompts import DEFLECTION_SCRIPT, EMERGENCY_STATEMENT
 from careflow.store import RuntimeStore
 from careflow.tools import CareFlowTools
 from careflow.workflows import AlreadyTriaged, pending_review, resume_triage, start_triage
-from careflow.workflows.triage import ASSISTANT_DEFLECTED
+from careflow.workflows.triage import ASSISTANT_DEFLECTED, URGENT_HANDOFF
 
 from .test_workflow import Harness, _call, _msg, _patient
 
@@ -68,11 +68,13 @@ def test_verified_patient_is_kept_when_the_message_cannot_be_parsed():
 # ---- M5-2: the band is never lowered -----------------------------------------------------------------
 def test_assistant_flag_is_raised_to_the_workflow_band_and_keeps_the_triage_reasons():
     steps = [_msg(calls=[_call("c1", "flag_for_human", reason="Needs a callback", urgency="Routine")]), _msg("Passed to staff.")]
-    h = Harness(parsed={"urgency": "Urgent"}, steps=steps)
-    r = _start(h, "I need an appointment.", _patient(h.tools))
+    h = Harness(steps=steps)  # a third contact: held at Priority, and the specialists still write a reply
+    ref = _patient(h.tools)
+    _earlier(h, ref, "appointment_booking", 30, 50)
+    r = _start(h, "I need an appointment.", ref)
     (flag,) = h.tools.flags
-    assert flag["urgency"] == "Urgent" and r.band == "Urgent"
-    assert "Needs a callback" in flag["reason"] and "SOP 4.8" in flag["reason"]
+    assert flag["urgency"] == "Priority" and r.band == "Priority"
+    assert "Needs a callback" in flag["reason"] and "8.2" in flag["reason"]
 
 
 def test_a_higher_band_from_the_assistant_is_kept():
@@ -255,10 +257,12 @@ def test_default_deps_with_a_checkpointer_share_the_durable_store(tmp_path, monk
 def test_a_clinical_deflection_by_the_assistant_replaces_the_administrative_reasons():
     steps = [_msg(calls=[_call("c1", "flag_for_human", reason="Asked about a dose", urgency="Routine", clinical=True)]),
              _msg(DEFLECTION_SCRIPT)]
-    h = Harness(parsed={"specialty": "Cardiology", "urgency": "Urgent"}, steps=steps)
-    r = _start(h, "I need an appointment.", _patient(h.tools, specialty="Cardiology"))
+    h = Harness(parsed={"specialty": "Cardiology"}, steps=steps)
+    ref = _patient(h.tools, specialty="Cardiology")
+    _earlier(h, ref, "appointment_booking", 30, 50)  # a third contact: the workflow's band is Priority
+    r = _start(h, "I need an appointment.", ref)
     assert (r.route, r.reasons) == ("refuse", [ASSISTANT_DEFLECTED])
-    assert h.tools.flags[0]["urgency"] == "Urgent"  # the ticket still carries the workflow's band
+    assert h.tools.flags[0]["urgency"] == "Priority"  # the ticket still carries the workflow's band
 
 
 def test_step_limit_flag_is_not_counted_as_the_assistant_asking_for_help():
@@ -278,3 +282,26 @@ def test_flag_and_review_ids_do_not_collide_after_a_row_is_removed():
     s.conn.execute("DELETE FROM reviews WHERE review_id = 'REV-0001'")
     assert s.add_flag(None, "reason 3", "Routine", "2026-08-01T09:00", contact_id="t3")[0]["flag_id"] == "FLAG-0003"
     assert s.add_review("t3", "human_review", ["x"], "2026-08-01T09:00")["review_id"] == "REV-0003"
+
+
+# ---- Lead's reply 0.8 (2026-11-22): the model is not asked about a case the code has decided is Urgent ----
+@pytest.mark.parametrize("parsed, text", [
+    ({"urgency": "Urgent"}, "I need an appointment."),
+    ({"urgency": "Routine"}, "The wound has opened up and two stitches have come out. I need an appointment soon."),
+])
+def test_an_urgent_case_gets_the_fixed_handoff_and_no_model_call(parsed, text):
+    clinical = [_msg(calls=[_call("c1", "flag_for_human", reason="Wound", urgency="Urgent", clinical=True)]), _msg(DEFLECTION_SCRIPT)]
+    h = Harness(parsed=parsed, steps=clinical)  # what the live model did when it was asked
+    r = _start(h, text, _patient(h.tools))
+    assert (r.route, r.band, r.status) == ("human_review", "Urgent", "awaiting_human_review")
+    assert h.offered == [] and r.response == URGENT_HANDOFF and not r.agent
+    assert "SOP 4.8" in r.reasons[0] and h.tools.booked == {}
+    (flag,) = h.tools.flags
+    assert flag["urgency"] == "Urgent" and "SOP 4.8" in flag["reason"]
+
+
+def test_a_routine_case_held_for_sign_off_still_gets_the_specialists_reply():
+    h = Harness(parsed={"specialty": "Cardiology"})
+    r = _start(h, "I need an appointment.", _patient(h.tools, specialty="Cardiology"))
+    assert r.route == "human_review" and h.offered and r.response == "Here is what I found."
+    assert "book_appointment" not in h.offered[0]

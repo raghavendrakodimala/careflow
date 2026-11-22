@@ -100,6 +100,8 @@ def main() -> None:
         r = d.start("urgent", "I had a mole removed last week and the wound has opened up, two of the stitches "
                     "have come out. I need a dermatology appointment as soon as possible.", p["urgent"], "demo-urgent")
         probs = [] if (r.route, r.status) == ("human_review", "awaiting_human_review") else [f"route {r.route}, status {r.status}"]
+        if r.agent:
+            probs.append("the assistant was run on an Urgent case")
         if "book_appointment" in (r.agent.get("tools_offered") or []):
             probs.append("booking was offered before the review")
         if d.tools.booked:

@@ -32,6 +32,11 @@ from .rerank import Reranker, default_reranker
 CANDIDATES = 20
 MAX_PER_DOCUMENT = 2
 RRF_K = 60  # the usual Reciprocal Rank Fusion constant (also Qdrant's)
+# A passage whose rerank score is within 1% of the best is a tie with it: spreading the results over
+# documents must not push it out. Golden case EV-019: three sections of the cost-share schedule scored
+# 0.998 to 0.9995 for "specialist visit co-pay"; one-per-document kept "Telehealth" and replaced the
+# co-pay table itself with an intake-SOP passage scoring 0.001, so every rephrased search missed it.
+NEAR_TIE = 0.99
 
 # Words that tie a question to one service line: its name, its code prefix and its procedures
 # (procedures.csv). Used only when the caller gave no specialty (feedback M4-3).
@@ -115,10 +120,16 @@ class PolicyRetriever:
         The eight handbooks are near-duplicates (each has a "plan coverage and pre-authorisation"
         section), so without the family limit a coverage question fills the top four with handbooks and
         pushes out the cost-share schedule and pre-authorisation matrix it actually needs.
-        Pass 2: up to `max_per_document` per document. Then everything else, in order. Nothing is dropped."""
+        Pass 2: up to `max_per_document` per document. Then everything else, in order. Nothing is dropped.
+        Before both passes, with a reranker: every passage that ties with the best (NEAR_TIE) keeps its
+        place, whatever its document. Without a reranker the scores are rank-based, so no tie is defined."""
         if not self.max_per_document or not hits:
             return hits
         order: list[int] = []
+        if self.reranker is not None:
+            best = max(h.score for h in hits)
+            if best > 0:
+                order = [i for i, h in enumerate(hits) if h.score >= NEAR_TIE * best]
         for per_doc, one_handbook in ((1, not scoped), (self.max_per_document, False)):
             for i, h in enumerate(hits):
                 if i in order:

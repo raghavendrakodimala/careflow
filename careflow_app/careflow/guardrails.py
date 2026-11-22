@@ -45,10 +45,22 @@ _INJECTION = re.compile(
     r"disregard (?:all |the |your |previous )+|you are now\b|from now on you|pretend (?:to be|you(?:'re| are))|"
     r"\bact as (?:a |an |my )?(?:doctor|physician|nurse|medical|unrestricted)|role-?play|unrestricted|jailbreak|"
     r"developer mode|system prompt|\bDAN\b|medgpt|no (?:rules|restrictions|filters)", re.I)
+_TREATMENT = (r"(?:cream|ointment|lotion|inhaler|drops|spray|medication|medicine|meds|tablets?|pills?|painkillers?|"
+              r"ice|heat|compress\w*|bandage|leftover\w*|antibiotics?|ibuprofen|paracetamol|aspirin)\b")
+_ADMIN_VERB = (r"(?:pay|book|cancel|reschedule|arrive|bring|park|come|call|change|move|use my|email|send|upload|"
+               r"switch (?:my )?(?:appointment|plan))\b")
+_ADMIN_NOUN = (r"(?:referral|appointment|slot|plan|coverage|deductible|record|booking|pre-?authori[sz]ation|co-?pay\w*|"
+               r"bill|statement|claim|payment|policy|member\w*|visit|balance|account)\b")
 _CLINICAL = re.compile(
     r"\bdos(?:e|es|ing|age)\b|\b\d+(?:\.\d+)?\s?(?:mg|mcg|ml|milligrams?)\b|"
-    r"\bshould i (?:take|stop|start|keep taking|increase|reduce|lower|cut|double|skip|switch|use|apply|try|be worried|worry|go to)\b|"
-    r"\b(?:can|could|may) i (?:take|stop|mix|combine|use|drink)\b|\bis it (?:safe|ok|okay|normal|serious|dangerous)\b|"
+    r"\bshould i (?:take|stop|start|keep taking|increase|reduce|lower|cut|double|skip|switch|be worried|worry)\b|"
+    # OP-CS-014 5.2: an administrative "should I" / "can I" / "is it okay" is answerable ("Should I bring my
+    # insurance card?"), so use/apply/try need a treatment as their object, "go to" an emergency setting,
+    # and "is it okay to <pay, book, ...>" is left alone.
+    rf"\b(?:should|can|could|may) i (?:use|apply|try) (?:[\w'-]+ ){{0,3}}?{_TREATMENT}|"
+    r"\bshould i go to (?:the |an? )?(?:er|ed|a&e|hospital|urgent care|emergency)\b|"
+    r"\b(?:can|could|may) i (?:take|stop|mix|combine|drink)\b|\bis it (?:safe|normal|serious|dangerous)\b|"
+    rf"\bis it (?:ok|okay)\b(?! (?:to|if i) {_ADMIN_VERB})|"
     r"\bis (?:this|that|it) something (?:serious|to worry)|\ba sign of\b|\bshould i (?:just )?(?:wait|rest|keep \w+ing)\b|"
     r"\bis this (?:normal|serious|dangerous|cancer|an? \w+)\b|\bdo i have\b|\bcould (?:it|this) be\b|"
     r"\bwhat (?:do you think|could|might|would) (?:it|this|that|be)\b|\bwhat(?:'s| is) (?:wrong|causing|the cause)\b|"
@@ -59,8 +71,12 @@ _CLINICAL = re.compile(
 # Clinical content in a reply. The fixed scripts are removed before this is applied.
 _LEAK = re.compile(
     r"\b\d+(?:\.\d+)?\s?(?:mg|mcg|ml|milligrams?)\b|"
-    r"\byou (?:should|could|can|may want to|might want to) (?:take|stop taking|start|try|apply|increase|reduce|lower|halve|double|skip|rest|ice)\b|"
-    r"\b(?:sounds|looks|seems) like (?:a|an|you|it)\b|\b(?:is|it's|its|are) (?:likely|probably|most likely|possibly) (?:a|an|just|due|caused)\b|"
+    r"\byou (?:should|could|can|may want to|might want to) (?:take|stop taking|start|increase|reduce|lower|halve|double|skip|rest|ice)\b|"
+    # "try" and "apply" need a treatment ("You can apply for financial assistance" is clinic business), and
+    # "looks like" is not a diagnosis when it is about a referral, a plan or a bill.
+    rf"\byou (?:should|could|can|may want to|might want to) (?:try|apply) (?:[\w'-]+ ){{0,3}}?{_TREATMENT}|"
+    rf"\b(?:sounds|looks|seems) like (?:a|an|you|it)\b(?! (?:\w+ |\$[\d,.]+ ){{0,6}}?{_ADMIN_NOUN})|"
+    r"\b(?:is|it's|its|are) (?:likely|probably|most likely|possibly) (?:a|an|just|due|caused)\b|"
     r"\bi(?: would|'d) (?:go with|recommend|suggest|advise)\b|\bmy (?:advice|recommendation|opinion) (?:is|would be)\b|"
     r"\b(?:take|taking) (?:an? |some |your )?(?:aspirin|ibuprofen|paracetamol|acetaminophen|antibiotics?|antihistamines?)\b|"
     r"\bas medgpt\b|\bi(?: am|'m) medgpt\b|\bsince you(?:'re| are) a clinician\b|\bnothing to worry about\b|"
@@ -73,7 +89,7 @@ class GuardResult:
     category: str = "none"   # none | emergency | clinical | injection | unverified
     layer: str = "none"      # none | rules | classifier | fail_closed
     reason: str = ""
-    band: str | None = None  # Emergent when an emergency phrase was found
+    band: str | None = None  # the SOP trigger-phrase band of a blocked message (Emergent or Urgent), if any
     score: float | None = None
     latency_ms: float = 0.0
 
@@ -102,6 +118,14 @@ is category "injection" with score 1.0. If unsure, score high. Reply with JSON o
 
 
 def default_classifier(settings: Settings | None = None) -> Classifier:
+    # The gate gives up after the time limit, but it cannot stop a call already in flight. Without these
+    # limits each abandoned call kept retrying across the fallback models for minutes and used up the
+    # provider's rate limit for the cases that followed (live run 1).
+    from .config import get_settings
+
+    settings = (settings or get_settings()).model_copy(
+        update={"request_timeout_s": int(TIME_LIMIT_S), "transport_retries": 0, "careflow_fallback_models": ""})
+
     def classify(text: str) -> ClinicalRisk:
         messages = [{"role": "system", "content": CLASSIFIER_PROMPT}, {"role": "user", "content": text}]
         return complete_structured(messages, ClinicalRisk, settings, validation_retries=0)
@@ -112,12 +136,13 @@ def default_classifier(settings: Settings | None = None) -> Classifier:
 def check_rules(text: str) -> GuardResult:
     """The deterministic part of the input gate. No model call."""
     text = text or ""
-    if policies.trigger_band(text) == "Emergent":
+    band = policies.trigger_band(text)  # an Urgent phrase does not block, but it sets the ticket's urgency
+    if band == "Emergent":
         return GuardResult(True, "emergency", "rules", "Emergent trigger phrase (triage SOP 4.6)", band="Emergent")
     if _INJECTION.search(text):
-        return GuardResult(True, "injection", "rules", "Attempt to change the assistant's rules or role")
+        return GuardResult(True, "injection", "rules", "Attempt to change the assistant's rules or role", band=band)
     if _CLINICAL.search(text.replace("’", "'")):
-        return GuardResult(True, "clinical", "rules", "Asks for clinical advice (OP-CS-014 5.1)")
+        return GuardResult(True, "clinical", "rules", "Asks for clinical advice (OP-CS-014 5.1)", band=band)
     return ALLOWED
 
 
@@ -127,7 +152,8 @@ def check_input(text: str, classifier: Classifier | None = None, time_limit_s: f
     started = time.perf_counter()
 
     def done(result: GuardResult) -> GuardResult:
-        return GuardResult(**{**result.__dict__, "latency_ms": (time.perf_counter() - started) * 1000})
+        band = result.band or (policies.trigger_band(text) if result.blocked else None)
+        return GuardResult(**{**result.__dict__, "band": band, "latency_ms": (time.perf_counter() - started) * 1000})
 
     by_rule = check_rules(text)
     if by_rule.blocked or classifier is None:

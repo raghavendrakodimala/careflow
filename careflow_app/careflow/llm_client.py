@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
-from typing import TypeVar
+from typing import TypeVar, Any
 
 import litellm
 from pydantic import BaseModel, ValidationError
@@ -53,6 +54,18 @@ def _schema_in_prompt(messages: list[dict], response_model: type[BaseModel]) -> 
     return [*messages, note]
 
 
+# What the most recent call in this context used: {"model", "input_tokens", "output_tokens"}. Set here,
+# read by the tracing wrappers (reliability.py), so the return values of the two functions below stay as
+# they are. The model is the one that answered, which is a fallback when the first one failed.
+LAST_CALL: contextvars.ContextVar[dict | None] = contextvars.ContextVar("careflow_last_call", default=None)
+
+
+def _note_call(model: str, resp: Any) -> None:
+    usage = getattr(resp, "usage", None)
+    LAST_CALL.set({"model": model, "input_tokens": getattr(usage, "prompt_tokens", None),
+                   "output_tokens": getattr(usage, "completion_tokens", None)})
+
+
 def complete_with_tools(messages: list[dict], tools: list[dict], settings: Settings | None = None):
     """One tool-calling turn. Returns the assistant message (may hold tool_calls).
 
@@ -75,6 +88,7 @@ def complete_with_tools(messages: list[dict], tools: list[dict], settings: Setti
         except _TRANSIENT as exc:
             last_error = exc
             continue
+        _note_call(model, resp)
         return resp.choices[0].message
     raise LLMClientError(f"all models failed ({', '.join(settings.models)}): {type(last_error).__name__}: {last_error}")
 
@@ -121,6 +135,7 @@ def complete_structured(
                 convo = _schema_in_prompt(convo, response_model)
                 continue
             attempts += 1
+            _note_call(model, resp)
             content = resp.choices[0].message.content or ""
             try:
                 return response_model.model_validate_json(_strip_fences(content))

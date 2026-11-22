@@ -3,10 +3,11 @@
 Run from careflow_app/ after building the index (python -m scripts.build_policy_index):
   python -m scripts.run_m8_eval                      # all 26 cases
   python -m scripts.run_m8_eval --cases EV-901 EX-003
-  python -m scripts.run_m8_eval --no-classifier      # input gate on rules only
+  python -m scripts.run_m8_eval --classifier hosted  # the chat model as the input-gate classifier
+  python -m scripts.run_m8_eval --classifier none    # input gate on rules only
 
 Each question goes through the team entry point the API's /v1/chat uses: the input gate (rules, then
-the model classifier within its time limit), the specialist agents with policy search, the output rules,
+the classifier within its time limit; by default the local one in careflow/guard_model.py), the specialist agents with policy search, the output rules,
 the Clinical Safety Reviewer and the grounding check. About 5 chat calls per answerable case and 1 or 2
 per refusal: roughly 110 to 140 calls in all, plus a few embedding calls.
 
@@ -82,13 +83,15 @@ def summarise(rows: list[dict]) -> dict:
 def main() -> None:
     from careflow.agents import default_reviewer, run_team
     from careflow.graph import Deps
-    from careflow.guardrails import default_classifier
+    from careflow.guard_model import build_classifier
     from careflow.rag.retriever import open_policy_search
     from careflow.tools import CareFlowTools
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", nargs="*", help="case ids (or their endings, e.g. EV-901) to run")
-    ap.add_argument("--no-classifier", action="store_true", help="input gate on rules only")
+    ap.add_argument("--classifier", choices=("local", "hosted", "none"),
+                    help="input-gate classifier (default: the CAREFLOW_GUARD_CLASSIFIER setting)")
+    ap.add_argument("--no-classifier", action="store_true", help="same as --classifier none")
     args = ap.parse_args()
     settings = get_settings()
     golden, extra = load_cases()
@@ -98,8 +101,11 @@ def main() -> None:
     if retriever.count() == 0:
         raise SystemExit("policy index is empty: run python -m scripts.build_policy_index first")
     reviewer = default_reviewer(settings)
-    classifier = None if args.no_classifier else default_classifier(settings)
-    print(f"M8 evaluation: index {retriever.count()} chunks; classifier {'off' if classifier is None else 'on'} "
+    mode = "none" if args.no_classifier else args.classifier or settings.careflow_guard_classifier
+    classifier = build_classifier(settings.model_copy(update={"careflow_guard_classifier": mode}))
+    if hasattr(classifier, "warm"):
+        classifier.warm()  # as the API does at start-up
+    print(f"M8 evaluation: index {retriever.count()} chunks; input-gate classifier {mode} "
           f"(time limit {settings.careflow_guard_timeout_s:g}s); model {settings.careflow_model}\n")
 
     results: dict[str, list[dict]] = {}

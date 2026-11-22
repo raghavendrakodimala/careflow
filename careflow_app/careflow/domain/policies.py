@@ -206,14 +206,45 @@ _URGENT = re.compile(
     r"hit my head", re.I)
 
 
+# A phrase the person rules out in the same breath ("no chest pain", "I do not have chest pain") is not
+# a report of it. Only a negation directly before the phrase counts; anything else still triggers
+# (SOP 4.4: upgrade on doubt).
+_NEGATED = re.compile(
+    r"\b(?:no|not|never|without|denies|deny|denying|(?:do|does|did)(?:n'?t| not) have|(?:don|doesn|didn)'?t have)"
+    r"\s+(?:any\s+|having\s+|a\s+|an\s+)?$", re.I)
+
+
+def _stated(pattern: re.Pattern, text: str) -> bool:
+    return any(not _NEGATED.search(text[:m.start()]) for m in pattern.finditer(text))
+
+
 def trigger_band(text: str | None) -> str | None:
     """The band the SOP's own trigger phrases put a message in, or None if it contains none of them."""
     text = (text or "").replace("\u2019", "'")
-    if _EMERGENT.search(text):
+    if _stated(_EMERGENT, text):
         return "Emergent"
-    if _URGENT.search(text):
+    if _stated(_URGENT, text):
         return "Urgent"
     return None
+
+
+# OP-CS-014 8.3: a caller who says they are a healthcare professional gets the same script, and the
+# Clinical Routing Ticket is marked so the clinician who picks it up knows. The claim is never verified.
+HCP_MARK = "Caller states HCP"
+_HCP = re.compile(
+    r"\b(?:i'?m|i am|as) an? (?:\w+ ){0,2}?(?:doctor|physician|cardiologist|surgeon|nurse|pharmacist|paramedic|"
+    r"medical student|clinician|gp|consultant|registrar|healthcare professional|health professional)\b|"
+    r"\b(?:clinician to clinician|doctor to doctor|colleague to colleague)\b|"
+    r"\bi work (?:for|at) (?:meridian|another (?:provider|clinic|hospital|practice))", re.I)
+
+
+def states_hcp(text: str | None) -> bool:
+    return bool(_HCP.search((text or "").replace("\u2019", "'")))
+
+
+def mark_hcp(reason: str, text: str | None) -> str:
+    """`reason` for a clinical ticket, marked when the caller's message states they are a professional."""
+    return f"{HCP_MARK}: {reason}" if states_hcp(text) and HCP_MARK not in reason else reason
 
 
 _TOPICS = (  # first match wins; the topics are the seed table's (memory.TOPIC_SUMMARY)

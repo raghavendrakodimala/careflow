@@ -31,9 +31,11 @@ class Settings(BaseSettings):
 
     # LiteLLM model string. Swap provider by changing this only, e.g.
     # "openrouter/meta-llama/llama-3.3-70b-instruct" or "ollama/llama3.1:8b".
-    careflow_model: str = "gemini/gemini-flash-latest"
+    # The lite model is first because the free tier allows gemini-flash-latest only 20 requests a day
+    # (found 2026-11-22); every recorded live result was produced by the lite model.
+    careflow_model: str = "gemini/gemini-flash-lite-latest"
     # Comma-separated, tried in order if the primary keeps failing (503, timeout).
-    careflow_fallback_models: str = "gemini/gemini-flash-lite-latest"
+    careflow_fallback_models: str = "gemini/gemini-flash-latest"
 
     gemini_api_key: str = Field("", validation_alias=AliasChoices("DATAGEN_GEMINI_API_KEY", "GEMINI_API_KEY"))
     openrouter_api_key: str = Field(
@@ -70,6 +72,7 @@ class Settings(BaseSettings):
     careflow_breaker_cooldown_s: float = 30.0
     # M8: input-gate classifier time limit (OP-CS-014 9.3 says 2 seconds), and the API.
     careflow_guard_timeout_s: float = 2.0
+    careflow_guard_classifier: str = "local"  # local (in-process, fast) | hosted (the chat model) | none (rules only)
     careflow_api_key: str = ""       # if set, every /v1 request must send it as X-API-Key
     careflow_api_use_mcp: bool = True  # the API reaches the EHR tools through the MCP server
 

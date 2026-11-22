@@ -315,7 +315,7 @@ def test_paused_case_survives_a_restart_and_resumes_without_repeating_side_effec
     assert done.response == r.response and done.reasons == r.reasons and done.plan == r.plan
     assert done.steps == [*r.steps, "finalize"]
     assert len(h2.tools.flags) == 1 and len(h2.tools.store.rows("reviews")) == 1  # nothing raised twice
-    assert h2.offered == [] and calls_before > 0  # the model was not called again on resume
+    assert h2.offered == [] and calls_before > 0  # the model was not called again on resume (a sign-off case)
     row = h2.tools.store.review(r.review_id)
     assert (row["status"], row["reviewer_id"]) == ("decided", "RN-0042")
     close_checkpointer(h2.checkpointer)

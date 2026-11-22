@@ -164,7 +164,9 @@ TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         "check_preauth",
         "Check whether a procedure is covered under a plan, whether it needs pre-authorisation, and the "
-        "approval window in business days. Give procedure_code with plan_code or patient_ref, or a referral_id.",
+        "approval window in business days. For a covered service it also says what the patient still pays: the "
+        "flat co-pay for consultations, imaging and lab work, or that the deductible and coinsurance apply. "
+        "Give procedure_code with plan_code or patient_ref, or a referral_id.",
         CheckPreauthInput,
         idempotent=True,
     ),

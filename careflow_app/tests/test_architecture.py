@@ -18,7 +18,7 @@ LAYERS = {
     "config": 1, "schemas": 1, "prompts": 1, "state": 1,
     "store": 2, "llm_client": 2, "tool_contracts": 2, "rag": 2, "telemetry": 2,
     "memory": 3, "intake": 3, "tools": 3, "grounding": 3, "reliability": 3, "guardrails": 3,  # framework-neutral services and tools
-    "graph": 4,
+    "graph": 4, "guard_model": 4,
     "agent": 5,
     "agents": 6,                                      # M6: the team, built on the single agent
     # Reserved for later milestones (a layer is needed before the package can exist):

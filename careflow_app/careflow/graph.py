@@ -37,6 +37,7 @@ from .config import Settings, get_settings
 from .llm_client import complete_with_tools
 from .grounding import GroundingResult, check_answer, corpus_documents, names_a_document
 from .memory import PRIORITY_MARK, PatientMemory, summarise_turn
+from .domain import policies
 from .prompts import DEFLECTION_SCRIPT, EMERGENCY_STATEMENT, SYSTEM_PROMPT
 from .reliability import BACKENDS, CircuitBreaker, ResilientTools, RetryPolicy, resilient_model
 from .state import CareFlowState
@@ -148,6 +149,46 @@ def _prepare_flag(
         if marker == PRIORITY_MARK and args.get("urgency", "Routine") == "Routine":
             args["urgency"] = "Priority"
     return json.dumps(args)
+
+
+REPEATED_SEARCH_NOTE = ("You already ran this exact search in this turn and these are the same passages. Do not "
+                        "search for it again: answer from the passages and tool results you have, use another "
+                        "tool (check_preauth or calculate_copay give co-pays and costs), or say you do not have "
+                        "the information and offer to pass the question to staff.")
+
+
+MAX_SEARCHES = 3  # per turn. Rewording a search that did not answer rarely helps; the step limit is 6.
+SEARCH_LIMIT_NOTE = (f"You have already searched the policies {MAX_SEARCHES} times in this turn, so this search was "
+                     "not run. Answer from the passages and tool results you have, use another tool "
+                     "(check_preauth or calculate_copay give co-pays and costs), or say you do not have the "
+                     "information and offer to pass the question to staff.")
+
+
+def _loads(raw: Any) -> Any:
+    try:
+        return json.loads(raw or "{}") if isinstance(raw, str) else dict(raw or {})
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _same_search(done: list[dict], raw: Any) -> dict | None:
+    """The result of an identical, successful search_policies call earlier in this turn, if there was one."""
+    args = _loads(raw)
+    if not isinstance(args, dict):
+        return None
+    for c in done:
+        if c["name"] == "search_policies" and c["result"].get("ok") and _loads(c["arguments"]) == args:
+            return c["result"]
+    return None
+
+
+def _mark_hcp_flag(raw: Any, asked: str | None) -> Any:
+    """A clinical flag the model raised, marked "Caller states HCP" when the caller's message says so."""
+    args = _loads(raw)
+    if not isinstance(args, dict) or not args.get("clinical") or not isinstance(args.get("reason"), str):
+        return raw
+    marked = policies.mark_hcp(args["reason"], asked)
+    return raw if marked == args["reason"] else json.dumps({**args, "reason": marked})
 
 
 def _turn_start(messages: list[dict]) -> int:
@@ -278,21 +319,33 @@ def build_agent_graph(
         if raised:
             return final
         urgency = "Emergent" if emergency else "Routine"
-        return [*_staff_flag(state, config, CLINICAL_TICKET_REASON, urgency, True, "ticket-1"), *final]
+        asked = state["messages"][_turn_start(state["messages"])].get("content")
+        reason = policies.mark_hcp(CLINICAL_TICKET_REASON, asked)  # OP-CS-014 8.3
+        return [*_staff_flag(state, config, reason, urgency, True, "ticket-1"), *final]
 
     def tools_node(state: CareFlowState, config: RunnableConfig) -> dict:
         out, update = [], {}
         bound = state.get("patient_ref")  # the verified patient, if any
         done = turn_tool_calls(state["messages"])  # this turn's earlier tool calls, for the repeat marker
+        searches = sum(c["name"] == "search_policies" for c in done)
         for call in state["messages"][-1]["tool_calls"]:
             name, raw = call["function"]["name"], call["function"]["arguments"]
+            searches += name == "search_policies"
             if name not in allowed:  # the model asked for a tool this agent does not have
                 result = {"ok": False, "error": f"tool {name!r} is not available to this agent", "tools": sorted(allowed)}
             elif bound and (others := _other_patients(deps.tools, raw, bound)):
                 # Deterministic, not left to the prompt: a verified conversation only touches its own
                 # patient's records (data-handling standard, minimum necessary).
                 result = {"ok": False, "error": OTHER_PATIENT_ERROR}
+            elif name == "search_policies" and (earlier := _same_search(done, raw)) is not None:
+                # The same search again returns the same passages. Say so instead of spending a step on it
+                # (golden case EV-019: five searches in a row, then the step limit).
+                result = {**earlier, "note": REPEATED_SEARCH_NOTE}
+            elif name == "search_policies" and searches > MAX_SEARCHES:
+                result = {"ok": False, "error": SEARCH_LIMIT_NOTE, "search_limit": MAX_SEARCHES}
             else:
+                if name == "flag_for_human":
+                    raw = _mark_hcp_flag(raw, state["messages"][_turn_start(state["messages"])].get("content"))
                 if name == "flag_for_human" and bound:
                     raw = _prepare_flag(deps.memory, raw, bound, done, _thread_id(config))
                 result = deps.tools.call(name, raw, context={"contact_id": _contact_id(config)})

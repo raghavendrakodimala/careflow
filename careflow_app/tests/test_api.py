@@ -28,7 +28,9 @@ def h():
 def test_health(h):
     with _client(h) as client:
         body = client.get("/health").json()
-    assert body == {"status": "ok", "patients": 400, "pending_reviews": 0, "policy_search": False, "tracing": False}
+    assert body == {"status": "ok", "patients": 400, "pending_reviews": 0, "policy_search": False, "tracing": False,
+                    "guard_classifier": "hosted",  # the test's fake is a plain callable, like the hosted one
+                    "mcp": "off", "breakers": {}}
 
 
 def test_triage_handles_a_routine_request_automatically(h):
