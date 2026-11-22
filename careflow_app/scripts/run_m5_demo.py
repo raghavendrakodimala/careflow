@@ -72,7 +72,7 @@ def main() -> None:
         r = d.start("auto", "Hello, I'd like to book a dermatology appointment for a routine skin check "
                     "sometime in the next few weeks. In person is fine.", p["auto"], "demo-auto")
         probs = [] if (r.route, r.status) == ("auto", "completed") else [f"route {r.route}, status {r.status}"]
-        if r.steps != ["intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]:
+        if r.steps != ["guard", "intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]:
             probs.append(f"steps {r.steps}")
         if d.tools.store.pending_reviews():
             probs.append("a review was requested")

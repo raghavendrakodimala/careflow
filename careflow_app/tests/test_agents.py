@@ -104,10 +104,10 @@ def test_reviewer_passes_a_normal_answer():
 
 
 def test_reviewer_veto_replaces_the_reply_and_raises_a_clinical_ticket():
-    t = Team(steps=[_msg("You could halve the dose to 5 mg.")])
+    t = Team(steps=[_msg("Those tablets are mainly used for blood pressure.")])  # past the output rules; the reviewer catches it
     ref = _patient(t.tools)
     r = run_team("What does my plan cover?", t.deps, reviewer=lambda message, reply: VETO, patient_ref=ref, thread_id="t1")
-    assert r.vetoed and r.answer == DEFLECTION_SCRIPT and "5 mg" not in r.answer
+    assert r.vetoed and r.answer == DEFLECTION_SCRIPT and "tablets" not in r.answer
     (flag,) = t.tools.flags
     assert (flag["category"], flag["patient_ref"], flag["reason"]) == ("clinical", ref, REVIEW_TICKET_REASON)
     assert r.tool_calls[-1]["agent"] == "clinical_safety_reviewer" and r.verdict["category"] == "medication"
@@ -139,7 +139,7 @@ def test_workflow_runs_the_specialist_then_the_reviewer():
     h = Harness()
     h.deps.review = lambda message, reply: SAFE
     r = h.start(_patient(h.tools))
-    assert r.steps == ["intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]
+    assert r.steps == ["guard", "intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]
     assert r.agent["agents"] == ["referral_tracker"] and r.verdict["safe"] is True
     assert (r.route, r.status) == ("auto", "completed")
 

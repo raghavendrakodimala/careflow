@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from .agent import AgentResult, run_agent
 from .config import Settings
 from .graph import DEFLECTION_MARK, Deps
+from .guardrails import Classifier, GuardResult, blocked_reply, check_input, check_output
 from .intake import parse_intake
 from .llm_client import complete_structured
 from .prompts import DEFLECTION_SCRIPT, INSURANCE_PROMPT, REFERRAL_PROMPT, REVIEWER_PROMPT
@@ -104,8 +105,12 @@ def default_reviewer(settings: Settings | None = None) -> Reviewer:
 
 
 def review_reply(message: str, reply: str, reviewer: Reviewer | None) -> SafetyVerdict:
-    """The reviewer's verdict on a draft. No reviewer configured: passed. A reply that is already the
+    """The verdict on a draft. First the output rules (M8, no model call): clinical wording is a veto
+    whatever the reviewer would say. Then the reviewer, if one is configured. A reply that is already the
     deflection script needs no review. Any failure to get a verdict is a veto (fail closed)."""
+    leak = check_output(reply)
+    if leak.blocked:
+        return SafetyVerdict(safe=False, category="other_clinical", reason=leak.reason[:300])
     if reviewer is None or not reply.strip() or DEFLECTION_MARK in " ".join(reply.lower().split()):
         return SafetyVerdict(safe=True, reason="not reviewed")
     try:
@@ -124,6 +129,19 @@ def withhold(deps: Deps, patient_ref: str | None, contact_id: str | None, urgenc
     return result
 
 
+INPUT_TICKET_REASON = "Message stopped by the input guard; Clinical Routing Ticket created (OP-CS-014 9.6)"
+
+
+def withhold_input(deps: Deps, patient_ref: str | None, contact_id: str | None, gate: GuardResult) -> dict:
+    """The clinical ticket for a message the input gate blocked."""
+    args: dict = {"reason": f"{INPUT_TICKET_REASON}: {gate.category}", "urgency": gate.band or "Routine", "clinical": True}
+    context = {"contact_id": contact_id} if contact_id else None
+    result = deps.tools.call("flag_for_human", {**args, "patient_ref": patient_ref} if patient_ref else args, context=context)
+    if not result.get("ok") and patient_ref:
+        result = deps.tools.call("flag_for_human", args, context=context)
+    return result
+
+
 # ---- the team --------------------------------------------------------------------------------------
 @dataclass
 class TeamResult:
@@ -135,6 +153,24 @@ class TeamResult:
     patient_ref: str | None = None
     verdict: dict | None = None                           # the reviewer's verdict, once reviewed
     vetoed: bool = False
+    guard: dict | None = None                             # the input gate's result (M8)
+    searched_nothing: bool = False
+
+    @property
+    def flags(self) -> list[dict]:
+        return [c["result"] for c in self.tool_calls if c["name"] == "flag_for_human" and c["result"].get("ok")]
+
+    @property
+    def route(self) -> str:
+        """auto | human_review | refuse, in the golden set's terms."""
+        deflected = DEFLECTION_MARK in " ".join(self.answer.lower().split())
+        if deflected or self.vetoed or any(f.get("category") == "clinical" for f in self.flags):
+            return "refuse"
+        searches = [c["result"] for c in self.tool_calls if c["name"] == "search_policies"]
+        nothing = bool(searches) and all(s.get("abstained") or not s.get("count") for s in searches)
+        if self.flags or self.stopped_early or self.ungrounded or nothing:
+            return "human_review"
+        return "auto"
 
     @property
     def tools_used(self) -> list[str]:
@@ -182,10 +218,23 @@ def team_deflected(answers: list[str]) -> bool:
 
 def run_team(message: str, deps: Deps, reviewer: Reviewer | None = None, patient_ref: str | None = None,
              channel: str = "web_form", thread_id: str | None = None, withheld: frozenset[str] | set[str] = frozenset(),
-             checkpointer=None) -> TeamResult:
-    """Specialists, then the Clinical Safety Reviewer. The chat path uses this; the triage workflow runs
-    the same two steps as separate nodes."""
+             checkpointer=None, guard: bool = False, classifier: Classifier | None = None,
+             guard_time_limit_s: float = 2.0) -> TeamResult:
+    """The input gate (M8, when `guard` is set), the specialists, then the output check and the Clinical
+    Safety Reviewer. The chat path uses this; the triage workflow runs the same steps as separate nodes."""
     with deps.tracer.trace(thread_id or uuid.uuid4().hex, "team", channel=channel, patient_ref=patient_ref) as root:
+        if guard:
+            with deps.tracer.span("guard.input", kind="guardrail") as span:
+                gate: GuardResult = check_input(message, classifier, guard_time_limit_s)
+                span.set(safe=not gate.blocked, category=gate.category)
+            if gate.blocked:  # no agent sees the message: the script and a clinical ticket, at once
+                flag = withhold_input(deps, patient_ref, thread_id, gate)
+                root.set(vetoed=True, category=gate.category)
+                return TeamResult(
+                    answer=blocked_reply(gate), patient_ref=patient_ref, vetoed=True, guard=gate.as_dict(),
+                    tool_calls=[{"name": "flag_for_human", "arguments": {"clinical": True}, "result": flag,
+                                 "agent": "input_guard"}],
+                )
         team = run_specialists(message, deps, patient_ref, channel, thread_id, withheld, checkpointer)
         with deps.tracer.span(f"agent.{REVIEWER.name}", kind="guardrail", agent=REVIEWER.name) as span:
             verdict = review_reply(message, team.answer, reviewer)
@@ -196,5 +245,7 @@ def run_team(message: str, deps: Deps, reviewer: Reviewer | None = None, patient
             team.vetoed, team.answer = True, DEFLECTION_SCRIPT
             team.tool_calls.append({"name": "flag_for_human", "arguments": {"clinical": True}, "result": flag,
                                     "agent": REVIEWER.name})
+        if guard:
+            team.guard = gate.as_dict()
         root.set(agents=team.agents, vetoed=team.vetoed)
     return team

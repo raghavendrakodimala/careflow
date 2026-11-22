@@ -200,6 +200,33 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
   - Breakers are per process and per `Deps`; they are not shared between API workers.
   - The agent graph's internal nodes (memory, ground, record) have no spans of their own; they sit inside the `agent.*` span.
 
+## M8 status: guardrails, evaluation and the API (branch feat/krp-milestone8, on top of M7)
+- **Guardrails** (`careflow/guardrails.py`), three layers:
+  - *Input gate* `check_input`: rules first (SOP Emergent phrases, prompt-injection markers, wording that asks for a diagnosis, a dose or what to do), then an optional model classifier. Threshold 0.30 (OP-CS-014 9.2). No answer within `CAREFLOW_GUARD_TIMEOUT_S` (default 2 seconds, 9.3), or a classifier error, blocks the message. A blocked message gets the deflection script (plus the emergency statement for an Emergent phrase) and a clinical ticket.
+  - *Scoped prompt*: unchanged from M2/M6.
+  - *Output check* `check_output`: clinical wording in a reply (doses, "you should take", "sounds like", ...) is a veto before the Clinical Safety Reviewer is asked, and even when no reviewer is configured. Then the reviewer (M6) and the grounding check (M4).
+- **Where the gate runs:**
+  - Triage workflow: a new first step `guard`, rules only. A blocked message is not sent to the intake model at all. The model-based check on this path is the intake parse (`seeks_clinical_advice`), so no second classifier call is made.
+  - Chat path: `run_team(..., guard=True, classifier=...)`. This differs from the plan, which put the gate inside `run_agent`: the gate needs to raise a ticket and return the script, which belongs with the team entry point the API calls.
+- **API** (`careflow/api/app.py`, `uvicorn careflow.api.app:app` from `careflow_app/`): `GET /health`, `POST /v1/triage`, `GET /v1/reviews`, `GET /v1/reviews/{thread_id}`, `POST /v1/reviews/{thread_id}/decision`, `POST /v1/chat`. Malformed body 422; reused or not-waiting thread 409; a re-band the policy forbids 422; model down on chat 503. Resources open once at start-up (durable store, checkpointer, EHR over MCP, policy index if built, tracer) and close at shutdown.
+- **Access:** no user login. If `CAREFLOW_API_KEY` is set, every `/v1` request must send it as `X-API-Key`. `patient_ref` in a request is trusted as verified by the calling channel.
+- **Evaluation:** `eval/refusal_cases.json` adds six hand-written refusal cases (ids `CAREFLOW-EX-001` to `006`) in the golden format; with them 10 of 26 cases expect a refusal (was 4 of 20). `data/` is untouched. `scripts/run_m8_eval.py` runs all 26 through the team entry point and reports the two sets separately: pass rate by category, route against `expected_route`, and input-gate latency.
+- **`scripts/run_all_checks.py`:** the test suite, the data validator, the M5 routing check and the M7 fault injection in one command, each with a 10-minute limit. Result on 2026-11-22: 4 of 4 passed in about 70 seconds. An earlier run stalled for over 30 minutes inside the routing check and was stopped; the cause was not found (the check runs in 22 seconds on its own). The runner now closes stdin for each step and fails a step that exceeds the limit.
+- `fastapi` 0.165.0 and `uvicorn` 0.54.0 installed on Python 3.15.2.
+- Offline tests: **532 passing** (`test_guardrails.py` with 30 blocked and 22 allowed prompts, `test_api.py`, `test_m8_eval.py`). Validator READY; `data/` unchanged.
+- **Checked without a model call:** the real service was started with `uvicorn` on temporary databases (MCP server and policy index loaded, start-up about 16 seconds). An emergency message returned the refuse payload with the 911 statement and a ticket; the case appeared in `/v1/reviews`, was decided over HTTP and completed; a malformed body gave 422; an injection on `/v1/chat` was refused by the rules.
+- **What the rules alone catch:** all golden refusal cases and none of the answerable ones. On the 197 labelled intake messages the rules alone catch 31 of the 50 that should be refused, with 1 extra block (a past seizure). The other 19 depend on the model layers, which caught all 50 in the M5 routing check. Two of the six extra cases pass the rules on purpose, to test those layers.
+- **NOT RUN (LIVE, needs the owner's go-ahead):** `python -m scripts.run_m8_eval`, about 110 to 140 chat calls. Until it runs there is **no measured pass rate for the full system**; the last live numbers are M4's (19/20, single agent). Also not run live: `run_m5_demo`, `run_m6_demo`, a traced run.
+- **Risks the live run must settle:**
+  - The 2-second classifier limit. A hosted model often takes longer, and every late answer is a refusal. If the eval shows that, raise `CAREFLOW_GUARD_TIMEOUT_S` or run the gate on rules only (`--no-classifier`) and record which.
+  - The team was not evaluated live. Specialist prompts and keyword routing may score differently from M4's single agent on the 15 answerable cases.
+  - EV-020 expects `refuse` for an unanswerable question and EV-905 expects `human_review`; the system sends both to `human_review`, so EV-020 will show a route mismatch.
+- **Fixed in passing:** `scripts/run_m4_eval.check_case` tested for the emergency statement with `"911" not in answer`, which could never fail because the deflection script also says 911. It now looks for the statement's own wording. The M4 logs show EV-901 did include the statement, so the M4 result stands.
+- **Limits to know:**
+  - The input rules have no negation handling and will over-block ("no chest pain", "is it ok to reschedule").
+  - `/v1/chat` keeps session history only when a `thread_id` is sent and the message needs one specialist.
+  - No Dockerfile, no rate limiting, no per-user authentication.
+
 ## Next steps
 1. Owner: approve the live M2 demo run; decide whether to tune the urgency prompt; decide on the `pending_verification` booking rule.
 2. Optional: show the client is provider-agnostic by running 5 records on OpenRouter (the key is in the toolkit `.env`; model and cost not yet checked). Ollama is not installed.
@@ -209,7 +236,7 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
    - M5: done (see M5 status).
    - M6: done (see M6 status).
    - M7: done (see M7 status).
-   - M8: guardrails against clinical advice, golden-set run, FastAPI service.
+   - M8: built (see M8 status); the live golden-set run is still to do.
 4. Slides (PDF) and the demo video.
 
 ## Open items and cautions

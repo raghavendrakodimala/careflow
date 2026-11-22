@@ -13,6 +13,7 @@ from ..schemas import Urgency
 class TriageState(TypedDict, total=False):
     record: dict            # the incoming message: channel, received_at, raw_text, patient_ref (if verified)
     answer: bool            # False = route only, do not run the assistant (routing evals)
+    guard: dict             # the input gate's result (M8): blocked, category, layer, reason
     intake: dict            # PatientRequest as a dict (M1)
     patient_ref: str | None
     band: str               # urgency band after "highest band wins"

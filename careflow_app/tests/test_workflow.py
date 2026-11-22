@@ -88,7 +88,7 @@ def test_graph_has_the_planned_nodes():
     graph = build_triage_graph(h.deps, h.checkpointer).get_graph()
     assert set(NODES) <= set(graph.nodes)
     edges = {(e.source, e.target) for e in graph.edges}
-    assert {("intake", "hydrate"), ("hydrate", "deflect"), ("hydrate", "eligibility"), ("eligibility", "routing"),
+    assert {("guard", "intake"), ("intake", "hydrate"), ("hydrate", "deflect"), ("hydrate", "eligibility"), ("eligibility", "routing"),
             ("routing", "team"), ("team", "safety_review"), ("safety_review", "decide"), ("deflect", "decide"), ("decide", "review"),
             ("decide", "finalize"), ("review", "finalize")} <= edges
 
@@ -96,7 +96,7 @@ def test_graph_has_the_planned_nodes():
 def test_auto_request_runs_the_steps_in_order_and_completes():
     h = Harness()
     r = h.start(_patient(h.tools))
-    assert r.steps == ["intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]
+    assert r.steps == ["guard", "intake", "hydrate", "eligibility", "routing", "team", "safety_review", "decide", "finalize"]
     assert (r.status, r.route, r.reasons) == ("completed", "auto", [])
     assert r.response == "Here is what I found."
     assert r.review_id is None and h.tools.flags == [] and h.tools.store.pending_reviews() == []
@@ -115,7 +115,7 @@ def test_clinical_question_gets_the_script_and_a_ticket_at_once_then_waits_for_s
     h = Harness(parsed={"seeks_clinical_advice": True})
     ref = _patient(h.tools)
     r = h.start(ref)
-    assert r.steps == ["intake", "hydrate", "deflect", "decide"]
+    assert r.steps == ["guard", "intake", "hydrate", "deflect", "decide"]
     assert (r.status, r.route) == ("awaiting_human_review", "refuse")
     assert r.response == DEFLECTION_SCRIPT
     assert h.offered == []  # the model never saw the message

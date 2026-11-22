@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     careflow_tool_retries: int = 3
     careflow_breaker_failures: int = 3
     careflow_breaker_cooldown_s: float = 30.0
+    # M8: input-gate classifier time limit (OP-CS-014 9.3 says 2 seconds), and the API.
+    careflow_guard_timeout_s: float = 2.0
+    careflow_api_key: str = ""       # if set, every /v1 request must send it as X-API-Key
+    careflow_api_use_mcp: bool = True  # the API reaches the EHR tools through the MCP server
 
     request_timeout_s: int = 90
     transport_retries: int = 3
