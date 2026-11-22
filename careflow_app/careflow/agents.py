@@ -20,6 +20,7 @@ with the deflection script and raises a Clinical Routing Ticket: fail closed (OP
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -156,11 +157,13 @@ def run_specialists(message: str, deps: Deps, patient_ref: str | None = None, ch
         text = message
         if answers:  # the second specialist sees what the patient has already been told
             text += f"\n\n(Already answered by the {team.agents[-1]} specialist: {answers[-1]})"
-        r: AgentResult = run_agent(
-            text, deps=deps, patient_ref=team.patient_ref, channel=channel, thread_id=thread_id,
-            tool_names=set(spec.tools) & available, system_prompt=spec.prompt,
-            checkpointer=checkpointer if len(specialists_for(message)) == 1 else None,
-        )
+        with deps.tracer.span(f"agent.{spec.name}", kind="agent", agent=spec.name, patient_ref=team.patient_ref) as span:
+            r: AgentResult = run_agent(
+                text, deps=deps, patient_ref=team.patient_ref, channel=channel, thread_id=thread_id,
+                tool_names=set(spec.tools) & available, system_prompt=spec.prompt,
+                checkpointer=checkpointer if len(specialists_for(message)) == 1 else None,
+            )
+            span.set(tool_calls=r.tools_used, case_status="stopped_early" if r.stopped_early else "answered")
         team.agents.append(spec.name)
         team.tool_calls += [{**c, "agent": spec.name} for c in r.tool_calls]
         team.stopped_early = team.stopped_early or r.stopped_early
@@ -182,12 +185,16 @@ def run_team(message: str, deps: Deps, reviewer: Reviewer | None = None, patient
              checkpointer=None) -> TeamResult:
     """Specialists, then the Clinical Safety Reviewer. The chat path uses this; the triage workflow runs
     the same two steps as separate nodes."""
-    team = run_specialists(message, deps, patient_ref, channel, thread_id, withheld, checkpointer)
-    verdict = review_reply(message, team.answer, reviewer)
-    team.verdict = verdict.model_dump()
-    if not verdict.safe:
-        flag = withhold(deps, team.patient_ref, thread_id)
-        team.vetoed, team.answer = True, DEFLECTION_SCRIPT
-        team.tool_calls.append({"name": "flag_for_human", "arguments": {"clinical": True}, "result": flag,
-                                "agent": REVIEWER.name})
+    with deps.tracer.trace(thread_id or uuid.uuid4().hex, "team", channel=channel, patient_ref=patient_ref) as root:
+        team = run_specialists(message, deps, patient_ref, channel, thread_id, withheld, checkpointer)
+        with deps.tracer.span(f"agent.{REVIEWER.name}", kind="guardrail", agent=REVIEWER.name) as span:
+            verdict = review_reply(message, team.answer, reviewer)
+            span.set(safe=verdict.safe, category=verdict.category)
+        team.verdict = verdict.model_dump()
+        if not verdict.safe:
+            flag = withhold(deps, team.patient_ref, thread_id)
+            team.vetoed, team.answer = True, DEFLECTION_SCRIPT
+            team.tool_calls.append({"name": "flag_for_human", "arguments": {"clinical": True}, "result": flag,
+                                    "agent": REVIEWER.name})
+        root.set(agents=team.agents, vetoed=team.vetoed)
     return team

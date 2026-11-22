@@ -180,6 +180,26 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
   - The MCP server uses the frozen clock, like the rest of the app.
   - The chat path (`run_agent`) still uses the single agent; `run_team` is the team entry point that M8's API will call.
 
+## M7 status: tracing and reliability (branch feat/krp-milestone7, on top of M6)
+- **Reliability** (`careflow/reliability.py`):
+  - `CircuitBreaker` (closed, open, half-open; injectable time) and `RetryPolicy` (injectable sleep).
+  - `ResilientTools` wraps any tools object. It retries only tools marked `idempotent` in `ToolDefinition`, so `book_appointment` is never sent twice. One breaker per backend (`ehr`, `policy_index`). A business error (`ok: false`) is an answer, not a failure.
+  - Fallback is never a guess: an unreachable tool returns `{"ok": false, "unavailable": true, "note": ...}` telling the agent to say so and flag staff.
+  - `resilient_model` adds a breaker around the model; when open it raises `ModelUnavailable` and the workflow hands the case to staff.
+  - Workflow rule added: if the eligibility or pre-authorisation lookup is unavailable, the route is `human_review` ("a clinic system could not be reached").
+- **Tracing** (`careflow/telemetry.py`): `CAREFLOW_TRACING=off|jsonl|langfuse`, default `jsonl` (`out/traces.jsonl`). One root span per request (`triage`, `triage.resume`, `team`), with child spans `step.*`, `agent.*`, `tool.*` and `model.complete`. The human-review pause is recorded as `paused`, not as an error. A sink that fails never breaks a request.
+- **LangFuse:** `LangfuseSink` mirrors the span tree. It switches on with `CAREFLOW_TRACING=langfuse` plus `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` (optional `LANGFUSE_HOST`) in `.env`; without keys it falls back to JSONL. **It is tested against a fake client only: no LangFuse account exists yet, so nothing has been sent to a real LangFuse project.**
+- **Privacy:** only attribute names in `telemetry.SAFE_KEYS` are recorded. The patient's message, the model's text, names, birth dates, member numbers and free-text reasons never reach a trace; kept strings are also scrubbed for member numbers and dates. `patient_ref` is kept as the pseudonymous record ID.
+- **Wiring:** `Deps.default` wraps tools and model and sets `Deps.tracer`. Tests build `Deps` by hand, and `tests/conftest.py` sets `CAREFLOW_TRACING=off`, so the suite writes no trace file.
+- `langfuse` 5.2.0 installed on Python 3.15.2.
+- Offline tests: **424 passing** (`test_reliability.py`, `test_telemetry.py`). Validator READY; `data/` unchanged.
+- **Fault injection, offline** (`python -m scripts.run_m7_chaos`, first 60 intake records): a flaky EHR (first two calls of each record fail) gives the same route on 60/60 after 82 retries; with the EHR down or the model down no case is automatic (0 auto, 43 human review) and all 17 refusals are kept; nothing is booked.
+- **Not run yet (LIVE):** a traced run with the real model, and LangFuse export once keys exist.
+- **Limits to know:**
+  - Token counts are not recorded: `complete_with_tools` returns the message without the provider's usage.
+  - Breakers are per process and per `Deps`; they are not shared between API workers.
+  - The agent graph's internal nodes (memory, ground, record) have no spans of their own; they sit inside the `agent.*` span.
+
 ## Next steps
 1. Owner: approve the live M2 demo run; decide whether to tune the urgency prompt; decide on the `pending_verification` booking rule.
 2. Optional: show the client is provider-agnostic by running 5 records on OpenRouter (the key is in the toolkit `.env`; model and cost not yet checked). Ollama is not installed.
@@ -188,7 +208,7 @@ Three memory tiers, as agreed in `architecture-and-design.md` §5.5:
    - M4: RAG with hybrid search and reranking; groundedness evaluation.
    - M5: done (see M5 status).
    - M6: done (see M6 status).
-   - M7: LangFuse tracing; retries, fallbacks, circuit breaker.
+   - M7: done (see M7 status).
    - M8: guardrails against clinical advice, golden-set run, FastAPI service.
 4. Slides (PDF) and the demo video.
 

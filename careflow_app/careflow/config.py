@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     careflow_retrieval_candidates: int = 20
     # A Qdrant server URL (M6/M8: several processes share it); empty = local mode at out/qdrant.
     careflow_qdrant_url: str = ""
+    # M7: tracing (off | jsonl | langfuse) and reliability. LangFuse needs both keys; without them the
+    # tracer falls back to the local JSONL file.
+    careflow_tracing: str = "jsonl"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = ""
+    careflow_tool_retries: int = 3
+    careflow_breaker_failures: int = 3
+    careflow_breaker_cooldown_s: float = 30.0
 
     request_timeout_s: int = 90
     transport_retries: int = 3

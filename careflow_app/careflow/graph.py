@@ -33,12 +33,14 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
-from .config import Settings
+from .config import Settings, get_settings
 from .llm_client import complete_with_tools
 from .grounding import GroundingResult, check_answer, corpus_documents, names_a_document
 from .memory import PRIORITY_MARK, PatientMemory, summarise_turn
 from .prompts import DEFLECTION_SCRIPT, EMERGENCY_STATEMENT, SYSTEM_PROMPT
+from .reliability import BACKENDS, CircuitBreaker, ResilientTools, RetryPolicy, resilient_model
 from .state import CareFlowState
+from .telemetry import NULL_TRACER, Tracer, default_tracer
 from .tools import TOOL_SPECS, CareFlowTools
 
 MAX_STEPS = 6
@@ -67,15 +69,26 @@ class Deps:
     tools: CareFlowTools
     model: Callable[[list[dict], list[dict]], Any]  # (messages, tool_specs) -> assistant message
     memory: PatientMemory | None = None  # M3 long-term patient memory; None turns it off
+    tracer: Tracer = NULL_TRACER  # M7: spans for steps, agents, tools and model calls
 
     @classmethod
     def default(cls, tools: CareFlowTools | None = None, settings: Settings | None = None) -> Deps:
+        """Production wiring (M7): tools and model wrapped with retries, circuit breakers and spans."""
         tools = tools or CareFlowTools()
-        return cls(
-            tools=tools,
-            model=lambda messages, specs: complete_with_tools(messages, specs, settings),
-            memory=PatientMemory(tools.store, tools.clock),
+        cfg = settings or get_settings()
+        tracer = default_tracer(cfg)
+        if not isinstance(tools, ResilientTools):
+            tools = ResilientTools(
+                tools, retry=RetryPolicy(attempts=cfg.careflow_tool_retries), tracer=tracer,
+                breakers={b: CircuitBreaker(b, cfg.careflow_breaker_failures, cfg.careflow_breaker_cooldown_s)
+                          for b in set(BACKENDS.values())},
+            )
+        model = resilient_model(
+            lambda messages, specs: complete_with_tools(messages, specs, settings),
+            CircuitBreaker("model", cfg.careflow_breaker_failures, cfg.careflow_breaker_cooldown_s),
+            tracer, name=cfg.careflow_model,
         )
+        return cls(tools=tools, model=model, memory=PatientMemory(tools.store, tools.clock), tracer=tracer)
 
 
 def _call_as_dict(call: Any) -> dict:
