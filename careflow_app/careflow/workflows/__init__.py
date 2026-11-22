@@ -88,7 +88,8 @@ def start_triage(record: dict, deps: TriageDeps | None = None, checkpointer: Any
                  thread_id: str | None = None, answer: bool = True) -> TriageResult:
     """Run one incoming message through the workflow. `answer=False` routes it without running the assistant."""
     thread_id = thread_id or uuid.uuid4().hex
-    graph = build_triage_graph(_deps(deps, durable=checkpointer is not None), checkpointer or MemorySaver())
+    deps = _deps(deps, durable=checkpointer is not None)
+    graph = build_triage_graph(deps, checkpointer or MemorySaver())
     if graph.get_state(_config(thread_id)).values.get("status") in (AWAITING, COMPLETED):
         raise AlreadyTriaged(thread_id)
     # Every field is set, so a retry after a crashed run never reads the earlier attempt's route or flag.
@@ -98,19 +99,24 @@ def start_triage(record: dict, deps: TriageDeps | None = None, checkpointer: Any
         "route": "", "reasons": [], "response": "", "agent": {}, "verdict": None, "flag_id": None, "review_id": None,
         "decision": None, "status": "running",
     }
-    graph.invoke(fresh, _config(thread_id))
-    return _result(thread_id, graph.get_state(_config(thread_id)).values)
+    with deps.agent.tracer.trace(thread_id, "triage", channel=record.get("channel")) as root:
+        graph.invoke(fresh, _config(thread_id))
+        result = _result(thread_id, graph.get_state(_config(thread_id)).values)
+        root.set(route=result.route, case_status=result.status, band=result.band, patient_ref=result.patient_ref,
+                 reasons_count=len(result.reasons), flag_id=result.flag_id, review_id=result.review_id)
+    return result
 
 
 def _paused_graph(deps: TriageDeps | None, checkpointer: Any):
     if checkpointer is None:
         raise ValueError("a paused case lives in a checkpointer: pass the one given to start_triage")
-    return build_triage_graph(_deps(deps, durable=True), checkpointer)
+    deps = _deps(deps, durable=True)
+    return build_triage_graph(deps, checkpointer), deps
 
 
 def pending_review(thread_id: str, deps: TriageDeps | None = None, checkpointer: Any = None) -> dict | None:
     """What staff are asked to decide for a paused case, or None if it is not paused."""
-    snapshot = _paused_graph(deps, checkpointer).get_state(_config(thread_id))
+    snapshot = _paused_graph(deps, checkpointer)[0].get_state(_config(thread_id))
     waiting = [i.value for t in snapshot.tasks for i in t.interrupts]
     return waiting[0] if waiting else None
 
@@ -118,7 +124,7 @@ def pending_review(thread_id: str, deps: TriageDeps | None = None, checkpointer:
 def resume_triage(thread_id: str, decision: dict | ReviewDecision, deps: TriageDeps | None = None,
                   checkpointer: Any = None) -> TriageResult:
     """Record the staff decision and finish the case. An invalid decision raises and the case stays paused."""
-    graph = _paused_graph(deps, checkpointer)
+    graph, deps = _paused_graph(deps, checkpointer)
     snapshot = graph.get_state(_config(thread_id))
     if "review" not in snapshot.next:
         raise NotAwaitingReview(thread_id)
@@ -126,8 +132,12 @@ def resume_triage(thread_id: str, decision: dict | ReviewDecision, deps: TriageD
     problem = policies.validate_reband(snapshot.values["band"], decision.urgency, decision.note)
     if problem:
         raise ValueError(problem)
-    graph.invoke(Command(resume=decision.model_dump()), _config(thread_id))
-    return _result(thread_id, graph.get_state(_config(thread_id)).values)
+    with deps.agent.tracer.trace(thread_id, "triage.resume", action=decision.action,
+                                 reviewer_id=decision.reviewer_id) as root:
+        graph.invoke(Command(resume=decision.model_dump()), _config(thread_id))
+        result = _result(thread_id, graph.get_state(_config(thread_id)).values)
+        root.set(route=result.route, case_status=result.status, band=result.band, review_id=result.review_id)
+    return result
 
 
 __all__ = ["AlreadyTriaged", "HANDOFF_ANSWER", "NODES", "NotAwaitingReview", "ReviewDecision", "TriageDeps",

@@ -30,6 +30,7 @@ Rules added after the architect's M5 review (feedback.md):
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable
@@ -54,6 +55,7 @@ INTAKE_FAILED = "Message could not be read automatically: failed closed and rout
 ASSISTANT_DEFLECTED = "The assistant deflected a clinical question (OP-CS-014 5.1)"
 REVIEWER_WITHHELD = "The Clinical Safety Reviewer withheld the reply (OP-CS-014 9.6)"
 REVIEW_REASON = "Triage review needed"
+SYSTEM_DOWN = "A clinic system could not be reached ({what}); nothing was assumed in its place"
 CLINICAL_ISSUE = "clinical_question"
 LIVE_REFERRAL = ("open", "accepted", "scheduled")
 NODES = ("intake", "hydrate", "deflect", "eligibility", "routing", "team", "safety_review", "decide", "review",
@@ -188,12 +190,14 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         r = tools.call("check_eligibility", {"patient_ref": ref}) if ref else {}
         status = r.get("eligibility_status") if r.get("ok") else "unknown"
         payment = policies.booking_payment(status, False, "").payment or "self_pay_offer"
-        out = {"status": status, "plan_code": r.get("plan_code"), "new_patient": r.get("new_patient"), "payment": payment}
+        out = {"status": status, "plan_code": r.get("plan_code"), "new_patient": r.get("new_patient"), "payment": payment,
+               "unavailable": bool(r.get("unavailable"))}  # M7: the EHR did not answer; staff must check
         return {"eligibility": out, "audit": audit("eligibility", status=status, payment=payment)}
 
     def routing_node(state: TriageState) -> dict:
         ref, band, specialty = state.get("patient_ref"), state["band"], state["intake"].get("specialty")
         referral, preauth, rejected = None, None, False
+        down = ["eligibility"] if state["eligibility"].get("unavailable") else []
         if ref and specialty:
             mine = sorted((r for r in store.rows_for_patient("referrals", ref) if r["to_specialty"] == specialty),
                           key=lambda r: (r["raised_on"], r["referral_id"]))
@@ -213,6 +217,8 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
                     preauth = {"procedure_code": p["procedure_code"], "covered": p["covered"],
                                "preauth_required": p["preauth_required"], "status": p["referral"]["preauth_status"],
                                "approval_window_business_days": p["approval_window_business_days"]}
+                elif p.get("unavailable"):
+                    down.append("pre-authorisation")
                 if not rejected:
                     band = policies.highest_band(band, row["urgency"])
         route, reasons = policies.triage_route(
@@ -222,6 +228,9 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
             referral_overdue=bool(referral and referral["overdue"]),
             repeat_priority=state.get("repeat") == PRIORITY_MARK,
         )
+        if down:  # M7: never route on a guess when a lookup failed
+            route = policies.ROUTE_HUMAN
+            reasons = [*reasons, SYSTEM_DOWN.format(what=" and ".join(down))]
         plan = {"specialty": specialty, "sign_off_required": policies.sign_off_required(specialty),
                 "referral": referral, "preauth": preauth, "payment": state["eligibility"]["payment"]}
         return {"band": band, "plan": plan, "route": route, "reasons": reasons,
@@ -260,7 +269,10 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         agent = state.get("agent") or {}
         if not agent or agent.get("error"):
             return {}  # nothing was written by the team
-        verdict = review_reply(state["record"]["raw_text"], state.get("response") or "", deps.review)
+        with deps.agent.tracer.span("agent.clinical_safety_reviewer", kind="guardrail",
+                                    agent="clinical_safety_reviewer") as span:
+            verdict = review_reply(state["record"]["raw_text"], state.get("response") or "", deps.review)
+            span.set(safe=verdict.safe, category=verdict.category)
         if verdict.safe:
             return {"verdict": verdict.model_dump(), "audit": audit("safety_review", safe=True)}
         ticket = withhold(deps.agent, state.get("patient_ref"), _thread(config), urgency=state["band"])
@@ -343,11 +355,27 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
     def after_decide(state: TriageState) -> str:
         return "finalize" if state["route"] == policies.ROUTE_AUTO else "review"
 
+    def traced(name: str, fn):
+        """The node with a span around it. functools.wraps keeps the signature LangGraph inspects."""
+        if not deps.agent.tracer.enabled:
+            return fn
+
+        @functools.wraps(fn)
+        def node(state: TriageState, *args, **kwargs):
+            with deps.agent.tracer.span(f"step.{name}", step=name, patient_ref=state.get("patient_ref")) as span:
+                update = fn(state, *args, **kwargs)
+                merged = {**state, **(update or {})}
+                span.set(route=merged.get("route") or None, band=merged.get("band"), flag_id=merged.get("flag_id"),
+                         review_id=merged.get("review_id"), safe=(merged.get("verdict") or {}).get("safe"))
+                return update
+
+        return node
+
     g = StateGraph(TriageState)
     for name, fn in (("intake", intake_node), ("hydrate", hydrate_node), ("deflect", deflect_node),
                      ("eligibility", eligibility_node), ("routing", routing_node), ("team", team_node),
                      ("safety_review", safety_review_node), ("decide", decide_node), ("review", review_node), ("finalize", finalize_node)):
-        g.add_node(name, fn)
+        g.add_node(name, traced(name, fn))
     g.add_edge(START, "intake")
     g.add_edge("intake", "hydrate")
     g.add_conditional_edges("hydrate", after_hydrate, {"deflect": "deflect", "eligibility": "eligibility"})
