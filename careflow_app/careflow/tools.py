@@ -344,15 +344,35 @@ class CareFlowTools:
         rule = self.preauth.get((code, plan))
         if rule is None:
             return self._err(f"no pre-authorisation rule for {code} under {plan}; refer to staff")
-        v = policies.preauth_verdict(rule, self.procedures[code], plan)
+        proc = self.procedures[code]
+        v = policies.preauth_verdict(rule, proc, plan)
+        # "Covered" is not "covered at 100 percent": say what kind of cost share applies. The co-pay table is
+        # keyed by service category and never names a procedure, so a policy search on "is an MRI covered"
+        # cannot find it (golden case EV-904). A flat co-pay is a plan term, the same for every member. It is
+        # left out for a named patient whose cover is not active (no insurance cost until it is verified).
+        cost = {}
+        patient = self.patients.get(_id(patient_ref)) if patient_ref else None
+        quotable = not patient_ref or (
+            patient is not None and policies.insurance_quote_allowed(patient["eligibility_status"]))
+        if v.covered:
+            cost["service_category"] = proc["category"]
+            flat = self.copays.get((plan, proc["category"]))
+            if proc["cost_share_basis"] == "copay" and flat is not None and quotable:
+                cost["flat_copay_usd"] = flat
+                cost["cost_share"] = (f"Covered is not covered at 100 percent: the patient pays the flat "
+                                      f"{proc['category']} co-pay of ${flat:,} under {plan}.")
+            elif proc["cost_share_basis"] != "copay":
+                cost["cost_share"] = ("Covered is not covered at 100 percent: the deductible, then coinsurance, "
+                                      "applies. Use calculate_copay for the amount.")
         return {
             "ok": True,
             "procedure_code": code,
-            "procedure_name": self.procedures[code]["procedure_name"],
+            "procedure_name": proc["procedure_name"],
             "plan_code": plan,
             "covered": v.covered,
             "preauth_required": v.preauth_required,
             "approval_window_business_days": v.approval_window_business_days,
+            **cost,
             **({"referral": referral} if referral else {}),
             "note": v.note,
         }
@@ -609,6 +629,8 @@ class CareFlowTools:
                 docs.append(f"{specialty} {HANDBOOK_SUFFIX}")  # the procedure's list price
             if result.get("basis"):
                 docs.append(COST_SHARE_SCHEDULE)  # deductible, coinsurance, flat co-pays
+        if name == "check_preauth" and "flat_copay_usd" in result:
+            docs.append(COST_SHARE_SCHEDULE)  # the flat co-pay by service category (clause 2.2)
         if name == "check_preauth" or "preauth_required" in result:
             docs.append(PREAUTH_MATRIX)
         return docs

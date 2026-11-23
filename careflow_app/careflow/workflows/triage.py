@@ -1,6 +1,6 @@
 """M5 triage workflow: a fixed LangGraph pipeline around the M1 intake parser and the M2-M4 agent.
 
-    START -> intake -> hydrate --(clinical / Emergent / intake failed)--> deflect ------+
+    START -> guard -> intake -> hydrate --(clinical / Emergent / intake failed)--> deflect ------+
                           |                                                             v
                           +-> eligibility -> routing -> team -> safety_review ------> decide
                                                                                         |
@@ -40,25 +40,32 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from ..agents import Reviewer, default_reviewer, review_reply, run_specialists, withhold
-from ..config import Settings
+from ..config import Settings, get_settings
 from ..domain import policies
+from ..guardrails import check_rules
 from ..graph import CLINICAL_TICKET_REASON, ESCALATION_ANSWER, ESCALATION_REASON, GROUNDING_REASON, Deps
 from ..intake import parse_intake
 from ..memory import PRIORITY_MARK, REPEAT_WINDOW, PatientMemory
 from ..prompts import DEFLECTION_SCRIPT, EMERGENCY_STATEMENT
+from ..reliability import guarded
 from ..schemas import PatientRequest
 from ..tools import CareFlowTools
 from .state import ReviewDecision, TriageState
 
 HANDOFF_ANSWER = "Your request has been passed to our staff, who will contact you."
+GUARD_BLOCKED = "Input guard: {reason}"
 INTAKE_FAILED = "Message could not be read automatically: failed closed and routed to a clinician (OP-CS-014 9.3)"
 ASSISTANT_DEFLECTED = "The assistant deflected a clinical question (OP-CS-014 5.1)"
 REVIEWER_WITHHELD = "The Clinical Safety Reviewer withheld the reply (OP-CS-014 9.6)"
 REVIEW_REASON = "Triage review needed"
+# The whole reply for an Urgent case. It states no time figure: SOP 4.8 is a staff procedure, not a promise
+# worded for patients.
+URGENT_HANDOFF = ("Your request has been marked urgent and passed to our clinical staff, who will contact you. "
+                  "If you think this is an emergency, call 911 now.")
 SYSTEM_DOWN = "A clinic system could not be reached ({what}); nothing was assumed in its place"
 CLINICAL_ISSUE = "clinical_question"
 LIVE_REFERRAL = ("open", "accepted", "scheduled")
-NODES = ("intake", "hydrate", "deflect", "eligibility", "routing", "team", "safety_review", "decide", "review",
+NODES = ("guard", "intake", "hydrate", "deflect", "eligibility", "routing", "team", "safety_review", "decide", "review",
          "finalize")
 
 
@@ -81,8 +88,13 @@ class TriageDeps:
 
     @classmethod
     def default(cls, tools: CareFlowTools | None = None, settings: Settings | None = None) -> TriageDeps:
-        return cls(agent=Deps.default(tools, settings), parse=lambda record: parse_intake(record, settings),
-                   settings=settings, review=default_reviewer(settings))
+        agent = Deps.default(tools, settings)
+        parse, review = (lambda record: parse_intake(record, settings)), default_reviewer(settings)
+        breaker = getattr(agent.model, "breaker", None)
+        if breaker is not None:  # M7-1: the two structured calls share the model's breaker and are traced
+            name = (settings or get_settings()).careflow_model
+            parse, review = guarded(parse, breaker, agent.tracer, name), guarded(review, breaker, agent.tracer, name)
+        return cls(agent=agent, parse=parse, settings=settings, review=review)
 
 
 def _thread(config: RunnableConfig) -> str:
@@ -127,11 +139,22 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         return state["record"].get("channel") or "web_form"
 
     # ---- nodes ----------------------------------------------------------------------------------
+    def guard_node(state: TriageState) -> dict:
+        """M8 input gate, rules only. The model-based check on this path is the intake parse that follows
+        (seeks_clinical_advice), so a second classifier call would add cost and nothing else."""
+        gate = check_rules(state["record"].get("raw_text") or "")
+        return {"guard": gate.as_dict(), "audit": audit("guard", blocked=gate.blocked, category=gate.category)}
+
     def intake_node(state: TriageState) -> dict:
         record = state["record"]
         ref = str(record.get("patient_ref") or "").strip().upper()
         ref = ref if ref in tools.patients else None  # verified by the channel: kept whatever happens next
         floor = policies.trigger_band(record.get("raw_text"))  # SOP 4.6 phrases: a floor under the model's band
+        gate = state.get("guard") or {}
+        if gate.get("blocked"):  # stopped at the gate: the message is not sent to the model at all
+            return {"intake": {}, "band": policies.highest_band(floor), "patient_ref": ref,
+                    "route": policies.ROUTE_REFUSE, "reasons": [GUARD_BLOCKED.format(reason=gate["reason"])],
+                    "audit": audit("intake", skipped="input guard", trigger_band=floor)}
         try:
             parsed = deps.parse(record).model_dump()
         except Exception as exc:  # fail closed: an unreadable message is treated as clinical (OP-CS-014 9.3)
@@ -175,7 +198,8 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         thread, ref, band = _thread(config), state.get("patient_ref"), state["band"]
         reasons = state.get("reasons") or policies.triage_route(
             seeks_clinical_advice=state["intake"]["seeks_clinical_advice"], urgency=band)[1]
-        reason = f"{state['repeat']}: {CLINICAL_TICKET_REASON}" if state.get("repeat") else CLINICAL_TICKET_REASON
+        reason = policies.mark_hcp(CLINICAL_TICKET_REASON, state["record"].get("raw_text"))  # OP-CS-014 8.3
+        reason = f"{state['repeat']}: {reason}" if state.get("repeat") else reason
         result = flag(thread, reason, band, ref, clinical=True)
         response = f"{EMERGENCY_STATEMENT}\n{DEFLECTION_SCRIPT}" if band == "Emergent" else DEFLECTION_SCRIPT
         if deps.memory is not None and result.get("ok"):
@@ -241,6 +265,12 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         withheld from all of them when staff must decide first."""
         if not state.get("answer", True):
             return {"agent": {}}
+        if state["band"] == "Urgent":
+            # SOP 4.8: a clinician contacts the patient within the hour and nothing is booked before that, so
+            # the assistant has nothing to add. A fixed reply: the model is not asked to triage the case again
+            # (live M5 demo, 2026-11-22: a specialist given the raw message deflected it as clinical, and that
+            # overruled the route decided here).
+            return {"agent": {}, "response": URGENT_HANDOFF, "audit": audit("team", skipped="Urgent band")}
         withheld = {"book_appointment"} if state["route"] != policies.ROUTE_AUTO else set()
         try:
             team = run_specialists(state["record"]["raw_text"], deps.agent, patient_ref=state.get("patient_ref"),
@@ -275,7 +305,8 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
             span.set(safe=verdict.safe, category=verdict.category)
         if verdict.safe:
             return {"verdict": verdict.model_dump(), "audit": audit("safety_review", safe=True)}
-        ticket = withhold(deps.agent, state.get("patient_ref"), _thread(config), urgency=state["band"])
+        ticket = withhold(deps.agent, state.get("patient_ref"), _thread(config), urgency=state["band"],
+                          message=state["record"].get("raw_text") or "", channel=channel(state))
         flags = [*(agent.get("flags") or []),
                  {"flag_id": ticket.get("flag_id"), "category": "clinical", "urgency": ticket.get("urgency") or state["band"],
                   "automatic": True}]
@@ -372,11 +403,12 @@ def build_triage_graph(deps: TriageDeps, checkpointer: Any = None):
         return node
 
     g = StateGraph(TriageState)
-    for name, fn in (("intake", intake_node), ("hydrate", hydrate_node), ("deflect", deflect_node),
+    for name, fn in (("guard", guard_node), ("intake", intake_node), ("hydrate", hydrate_node), ("deflect", deflect_node),
                      ("eligibility", eligibility_node), ("routing", routing_node), ("team", team_node),
                      ("safety_review", safety_review_node), ("decide", decide_node), ("review", review_node), ("finalize", finalize_node)):
         g.add_node(name, traced(name, fn))
-    g.add_edge(START, "intake")
+    g.add_edge(START, "guard")
+    g.add_edge("guard", "intake")
     g.add_edge("intake", "hydrate")
     g.add_conditional_edges("hydrate", after_hydrate, {"deflect": "deflect", "eligibility": "eligibility"})
     g.add_edge("deflect", "decide")

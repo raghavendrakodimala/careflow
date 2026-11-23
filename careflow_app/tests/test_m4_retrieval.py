@@ -150,6 +150,28 @@ def test_documents_are_spread_one_then_two_per_document():
     assert PolicyRetriever(ListIndex(hits), max_per_document=None).rank("q") == hits
 
 
+class _Scores:
+    name = "fixed"
+
+    def __init__(self, table):
+        self.table = table
+
+    def score(self, query, passages):
+        return [self.table[p] for p in passages]
+
+
+def test_a_passage_that_ties_with_the_best_is_not_pushed_out_by_spreading():  # golden case EV-019
+    # Three sections of one document tie at the top; other documents score near zero.
+    hits = [_hit("S", 0, 1), _hit("S", 0, 2), _hit("S", 0, 3), _hit("H", 0, 1), _hit("M", 0, 1), _hit("I", 0, 1)]
+    table = {"S 1": 0.9995, "S 2": 0.9990, "S 3": 0.9980, "H 1": 0.5, "M 1": 0.05, "I 1": 0.001}
+    top4 = [h.text for h in PolicyRetriever(ListIndex(hits), reranker=_Scores(table)).rank("q")[:4]]
+    assert top4 == ["S 1", "S 2", "S 3", "H 1"]
+    # A passage that is merely good (not a tie) is still spread as before: one per document first.
+    table["S 2"], table["S 3"] = 0.9, 0.8
+    ranked = [h.text for h in PolicyRetriever(ListIndex(hits), reranker=_Scores(table)).rank("q")]
+    assert ranked[:4] == ["S 1", "H 1", "M 1", "I 1"] and len(ranked) == 6
+
+
 def test_fused_order_keeps_what_retrieval_ranked_first():
     # Retrieval ranked B first; the reranker prefers A1, A2, A3. Pure rerank order puts B last; fusion of
     # the two ranks keeps B in the top two. The shown score is the cross-encoder's either way.

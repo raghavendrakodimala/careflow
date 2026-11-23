@@ -19,10 +19,12 @@ Rules:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .llm_client import LAST_CALL
 from .telemetry import NULL_TRACER, Tracer
 from .tool_contracts import TOOLS_BY_NAME
 
@@ -49,31 +51,36 @@ class CircuitBreaker:
         self.failures = 0
         self.opened_at: float | None = None
         self._trial = False  # a half-open trial call is in flight
+        self._lock = threading.RLock()  # the API's worker threads share one breaker per backend
 
     @property
     def state(self) -> str:
-        if self.opened_at is None:
-            return CLOSED
-        return HALF_OPEN if self.now() - self.opened_at >= self.cooldown_s else OPEN
+        with self._lock:
+            if self.opened_at is None:
+                return CLOSED
+            return HALF_OPEN if self.now() - self.opened_at >= self.cooldown_s else OPEN
 
     def allow(self) -> bool:
         """May a call go through now? In half-open, only one trial at a time."""
-        state = self.state
-        if state == CLOSED:
-            return True
-        if state == HALF_OPEN and not self._trial:
-            self._trial = True
-            return True
-        return False
+        with self._lock:
+            state = self.state
+            if state == CLOSED:
+                return True
+            if state == HALF_OPEN and not self._trial:
+                self._trial = True
+                return True
+            return False
 
     def record_success(self) -> None:
-        self.failures, self.opened_at, self._trial = 0, None, False
+        with self._lock:
+            self.failures, self.opened_at, self._trial = 0, None, False
 
     def record_failure(self) -> None:
-        self.failures += 1
-        if self._trial or self.failures >= self.failure_threshold:
-            self.opened_at = self.now()  # open, or re-open after a failed trial
-        self._trial = False
+        with self._lock:
+            self.failures += 1
+            if self._trial or self.failures >= self.failure_threshold:
+                self.opened_at = self.now()  # open, or re-open after a failed trial
+            self._trial = False
 
 
 @dataclass
@@ -155,14 +162,43 @@ def resilient_model(model: Callable[[list[dict], list[dict]], Any], breaker: Cir
             raise ModelUnavailable(f"model circuit is {breaker.state}")
         with tracer.span("model.complete", kind="generation", model=name, messages=len(messages),
                          tools_offered=len(specs)) as span:
+            LAST_CALL.set(None)
             try:
                 message = model(messages, specs)
             except Exception:
                 breaker.record_failure()
                 raise
             breaker.record_success()
-            span.set(tool_calls=[c.function.name for c in (getattr(message, "tool_calls", None) or [])])
+            span.set(tool_calls=[c.function.name for c in (getattr(message, "tool_calls", None) or [])], **_used())
             return message
 
     call.breaker = breaker  # type: ignore[attr-defined]
+    return call
+
+
+def _used() -> dict:
+    """The model that actually answered and its token counts, when the client recorded them."""
+    return {k: v for k, v in (LAST_CALL.get() or {}).items() if v is not None}
+
+
+def guarded(fn: Callable[..., Any], breaker: CircuitBreaker, tracer: Tracer = NULL_TRACER,
+            name: str = "model") -> Callable[..., Any]:
+    """A structured model call (the intake parse, the Clinical Safety Reviewer) behind the same breaker and
+    with the same generation span as the tool-calling model. When the breaker is open it raises
+    ModelUnavailable at once; both callers already fail closed on any error."""
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        if not breaker.allow():
+            raise ModelUnavailable(f"model circuit is {breaker.state}")
+        with tracer.span("model.complete", kind="generation", model=name) as span:
+            LAST_CALL.set(None)
+            try:
+                result = fn(*args, **kwargs)
+            except Exception:
+                breaker.record_failure()
+                raise
+            breaker.record_success()
+            span.set(**_used())
+            return result
+
     return call

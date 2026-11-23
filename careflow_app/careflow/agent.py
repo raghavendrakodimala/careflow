@@ -24,7 +24,12 @@ from .config import SESSIONS_DB, Settings
 from .graph import MAX_STEPS, Deps, build_agent_graph, turn_tool_calls
 from .llm_client import LLMClientError
 from .prompts import SYSTEM_PROMPT
+from .state import REDACT
 from .tools import CareFlowTools
+
+
+class PatientMismatch(ValueError):
+    """A turn named a different patient from the one this conversation is already verified for."""
 
 
 @dataclass
@@ -99,7 +104,12 @@ def run_agent(
         config["configurable"] = {"contact_id": thread_id, "thread_id": thread_id}
     if checkpointer is not None:
         config["configurable"] = {"thread_id": thread_id or "default"}
-        before = graph.get_state(config).values.get("messages", [])
+        saved = graph.get_state(config).values
+        before = saved.get("messages", [])
+        # The thread holds one patient's conversation. A different patient_ref on it would put that
+        # history in front of another patient (data-handling standard 4.1): refuse the turn.
+        if patient_ref and saved.get("patient_ref") and saved["patient_ref"] != patient_ref:
+            raise PatientMismatch(thread_id or "default")
 
     turn: dict = {
         "messages": [{"role": "user", "content": user_message + context}],
@@ -123,4 +133,22 @@ def run_agent(
     )
 
 
-__all__ = ["AgentResult", "run_agent", "session_checkpointer", "close_checkpointer", "LLMClientError", "SYSTEM_PROMPT"]
+def thread_patient(deps: Deps, checkpointer: Any, thread_id: str | None) -> str | None:
+    """The patient a checkpointed conversation is verified for, or None."""
+    if checkpointer is None:
+        return None
+    graph = build_agent_graph(deps, checkpointer=checkpointer)
+    return graph.get_state({"configurable": {"thread_id": thread_id or "default"}}).values.get("patient_ref")
+
+
+def redact_answers(deps: Deps, checkpointer: Any, thread_id: str | None, text: str, count: int = 1) -> None:
+    """Replace the last `count` stored answers on a thread with `text` (a vetoed reply; see state.add_messages)."""
+    if checkpointer is None:
+        return
+    graph = build_agent_graph(deps, checkpointer=checkpointer)
+    graph.update_state({"configurable": {"thread_id": thread_id or "default"}},
+                       {"messages": [{"role": REDACT, "content": text, "count": count}]}, as_node="record")
+
+
+__all__ = ["AgentResult", "PatientMismatch", "run_agent", "session_checkpointer", "close_checkpointer", "thread_patient",
+           "redact_answers", "LLMClientError", "SYSTEM_PROMPT"]

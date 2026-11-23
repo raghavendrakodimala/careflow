@@ -29,12 +29,27 @@ APP_ROOT = Path(__file__).resolve().parents[2]  # the folder that holds the `car
 _STOP = object()
 
 
+# What the EHR server needs from the parent's environment: the operating system's basics and CareFlow's
+# own settings. Provider, LangFuse and API keys are not passed on; the server calls no model.
+_ENV_KEEP = {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "HOME",
+             "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "TZ", "VIRTUAL_ENV",
+             "PYTHONIOENCODING", "PYTHONUTF8"}
+_ENV_DROP = {"CAREFLOW_API_KEY"}
+
+
+def _child_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items()
+            if (k.upper() in _ENV_KEEP or k.upper().startswith("CAREFLOW_")) and k.upper() not in _ENV_DROP}
+
+
 class McpUnavailable(RuntimeError):
     """The MCP server could not be started or has stopped answering."""
 
 
 class McpClient:
-    def __init__(self, db_path: Path | str, timeout_s: float = 30.0):
+    def __init__(self, db_path: Path | str, timeout_s: float = 10.0, startup_timeout_s: float = 30.0):
+        # A call that gets no answer is retried by ResilientTools, so the per-call limit is short; only the
+        # cold start of the child process gets the long one.
         self.db_path, self.timeout_s = str(db_path), timeout_s
         self.tools: list[dict] = []  # [{name, description, input_schema}] as the server lists them
         self._loop = asyncio.new_event_loop()
@@ -43,7 +58,7 @@ class McpClient:
         self._thread = threading.Thread(target=self._run, name="careflow-mcp", daemon=True)
         self._thread.start()
         try:
-            self._ready.result(timeout=timeout_s)
+            self._ready.result(timeout=startup_timeout_s)
         except Exception as exc:
             raise McpUnavailable(f"MCP server did not start: {type(exc).__name__}: {exc}") from exc
 
@@ -59,7 +74,7 @@ class McpClient:
         self._queue = asyncio.Queue()
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "careflow.mcp"], cwd=str(APP_ROOT),
-            env={**os.environ, "CAREFLOW_RUNTIME_DB": self.db_path, "PYTHONPATH": str(APP_ROOT)},
+            env={**_child_env(), "CAREFLOW_RUNTIME_DB": self.db_path, "PYTHONPATH": str(APP_ROOT)},
         )
         try:
             async with Client(params) as client:

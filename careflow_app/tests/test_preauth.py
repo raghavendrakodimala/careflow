@@ -65,3 +65,34 @@ def test_bad_inputs_are_errors_not_exceptions(t):
 def test_tool_is_registered_and_described_to_the_model(t):
     assert t.call("check_preauth", {"procedure_code": "ORTH-MRI", "plan_code": "MERIDIAN-BRONZE"})["ok"]
     assert "check_preauth" in {s["function"]["name"] for s in TOOL_SPECS}
+
+
+# ---- what a covered service still costs (golden case EV-904) --------------------------------
+def test_covered_imaging_reports_the_flat_copay_and_cites_the_schedule():
+    t = CareFlowTools()
+    for code in ("ORTH-MRI", "NEUR-MRI"):
+        r = t.call("check_preauth", {"procedure_code": code, "plan_code": "MERIDIAN-BRONZE"})
+        assert (r["covered"], r["preauth_required"], r["approval_window_business_days"]) == (True, True, 5)
+        assert (r["service_category"], r["flat_copay_usd"]) == ("imaging", 160)
+        assert "$160" in r["cost_share"] and "not covered at 100 percent" in r["cost_share"]
+        assert r["source"] == ["Co-payment and Cost-Share Schedule", "Pre-Authorisation Requirement Matrix"]
+
+
+def test_covered_procedure_points_to_the_calculator_and_gives_no_amount():
+    r = CareFlowTools().call("check_preauth", {"procedure_code": "GAST-COLO", "plan_code": "MERIDIAN-SILVER"})
+    assert r["service_category"] == "procedure" and "flat_copay_usd" not in r
+    assert "calculate_copay" in r["cost_share"] and r["source"] == ["Pre-Authorisation Requirement Matrix"]
+
+
+def test_no_cost_share_for_an_uncovered_service_or_a_patient_without_active_cover():
+    t = CareFlowTools()
+    r = t.call("check_preauth", {"procedure_code": "ORTH-ARTH", "plan_code": "CIVIC-BASE"})
+    assert r["covered"] is False and "cost_share" not in r and "flat_copay_usd" not in r
+    for p in t.patients.values():
+        if p["eligibility_status"] != "active":
+            r = t.call("check_preauth", {"procedure_code": "ORTH-MRI", "patient_ref": p["patient_ref"]})
+            if r.get("ok") and r["covered"]:
+                assert "flat_copay_usd" not in r and "cost_share" not in r
+                break
+    else:
+        raise AssertionError("no covered check for a patient without active cover in this dataset")
