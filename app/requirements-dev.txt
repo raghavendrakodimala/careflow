@@ -1,0 +1,7 @@
+# Development: tests, lint and training the local classifier. Installs the runtime set too.
+-r requirements.txt
+pytest>=9.2,<10
+pytest-cov>=6,<8       # coverage: python -m pytest tests --cov=src --cov=scripts
+httpx>=0.28,<1         # FastAPI's TestClient
+ruff>=0.17,<1
+scikit-learn>=1.9,<2   # scripts/train_guard_classifier.py only

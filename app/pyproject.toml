@@ -1,0 +1,37 @@
+[project]
+name = "careflow"
+version = "1.0.0"
+description = "CareFlow: scheduling and insurance assistant for an outpatient clinic (capstone project)"
+requires-python = ">=3.11"
+
+# Dependencies are in requirements.txt (runtime) and requirements-dev.txt (tests, lint, training).
+# The project is run from this folder and is not installed as a package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["out"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",  # pycodestyle and pyflakes
+    "I",            # import order
+    "B",            # likely bugs
+    "UP",           # outdated syntax
+    "SIM",          # needless complexity
+    "C4",           # comprehensions
+    "RUF",          # ruff's own checks
+]
+ignore = [
+    "E501",    # line length is advisory: tables of test cases and policy citations read better unwrapped
+    "RUF001",  # the corpus and the tests use typographic characters on purpose
+    "RUF002",
+    "C408",    # dict(key=value) is used on purpose for keyword-argument tables
+    "B008",    # FastAPI's Depends() in argument defaults is the framework's idiom
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "scripts", "tests"]
