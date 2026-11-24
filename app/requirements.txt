@@ -1,0 +1,15 @@
+# Runtime dependencies. Lower bounds are the versions the project was built and tested on;
+# upper bounds stop at the next major release.
+litellm>=1.109,<2
+langgraph>=1.2,<2
+langgraph-checkpoint-sqlite>=3.1,<4
+pydantic>=2.14,<3
+pydantic-settings>=2.16,<3
+qdrant-client>=1.20,<2
+pypdf>=7.1,<8
+sentence-transformers>=6.3,<7
+numpy>=2.5,<3
+mcp>=2.3,<3
+langfuse>=5.2,<6
+fastapi>=0.165,<1
+uvicorn>=0.54,<1          # runs the API: uvicorn src.api.app:app
