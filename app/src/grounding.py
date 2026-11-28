@@ -59,9 +59,11 @@ _NUMBER = rf"(?:\d[\d,]*(?:\.\d+)?|{_WORD_NUMBER})"  # digits (with thousands co
 _START = r"(?<![\w.-])"  # not inside a word, a decimal or a hyphenated compound ("twenty-four" is one number)
 _MONEY = re.compile(r"\$\s?(\d[\d,]*(?:\.\d+)?)")  # "$1,200.50", "$ 45"; group 1 is the amount
 _PERCENT = re.compile(rf"{_START}(\d+(?:\.\d+)?)\s?(?:%|percent\b|per cent\b)", re.I)
-# "5 business days", "30-minute", "thirty minutes": group 1 the number, 2 the optional qualifier, 3 the unit.
+# "5 business days", "5 business-day", "30-minute", "thirty minutes": group 1 the number, 2 the optional
+# qualifier, 3 the unit. A hyphen may join any two parts; without it in the qualifier, "a 5 business-day
+# window" was not a figure at all, so the grounding check never saw it.
 _DURATION = re.compile(
-    rf"{_START}({_NUMBER})(?:-|\s+)(business\s+|working\s+|calendar\s+|clock\s+)?(minute|hour|day|week|month|year)s?\b",
+    rf"{_START}({_NUMBER})(?:-|\s+)((?:business|working|calendar|clock)(?:-|\s+))?(minute|hour|day|week|month|year)s?\b",
     re.I,
 )
 # An upper-case hyphenated code of two to four parts: procedure (GAST-COLO), policy (OP-CS-014), plan (MERIDIAN-SILVER).
@@ -96,7 +98,7 @@ def find_figures(text: str) -> dict[str, str]:
     for match in _PERCENT.finditer(text):
         found[f"{_normalise_number(match.group(1))}%"] = match.group(0)
     for match in _DURATION.finditer(text):
-        qualifier = (match.group(2) or "").strip().lower().replace("working", "business")
+        qualifier = (match.group(2) or "").strip(" \t\n-").lower().replace("working", "business")
         found[" ".join(part for part in (_normalise_number(match.group(1)), qualifier, match.group(3).lower())
                        if part)] = match.group(0)
     for match in _CODE.finditer(text):

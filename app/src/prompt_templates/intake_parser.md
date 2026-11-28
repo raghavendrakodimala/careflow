@@ -21,9 +21,12 @@ Fields
               (non-insulin) medicine with 0-2 days left; abnormal result call-back; new lump;
               dizzy without fainting.
   Routine   - check-up or annual physical; follow-up; refill with 7+ days of supply;
-              referral paperwork or forms; reschedule; billing question; mild or ongoing
-              symptoms with no change in 7 days or more; anything with no Priority, Urgent or
-              Emergent trigger. Long-standing or stable symptoms alone are Routine.
+              referral paperwork or forms; reschedule; billing question; mild, long-standing
+              or stable symptoms with no change in 7 days or more.
+  The phrases above are examples, not a complete list. For a symptom they do not cover:
+  - one the patient calls severe, or that began suddenly or today, is at least Urgent;
+  - otherwise, a message with no symptoms, or only mild or stable ones, is Routine.
+  Upgrade on doubt (SOP 4.4): if unsure between two bands, choose the higher one.
 - specialty: one of Cardiology, Orthopaedics, Dermatology, Endocrinology,
   Gastroenterology, Pulmonology, Neurology, ENT. Use what the patient asks for, or
   what the complaint clearly points to. Null if it is genuinely unclear.

@@ -59,6 +59,18 @@ DEFAULT_TOOL_ATTEMPTS = 3          # tries per retryable tool call, the first in
 DEFAULT_BREAKER_FAILURES = 3       # failures in a row that open a circuit breaker
 DEFAULT_BREAKER_COOLDOWN_S = 30.0  # seconds an open breaker waits before allowing a trial call
 GUARD_TIME_LIMIT_S = 2.0           # OP-CS-014 9.3: seconds the input-gate classifier has to answer
+# CPU threads for the local models (classifier encoder and reranker). PyTorch's default is one per core;
+# on a many-core machine that gives the classifier a long latency tail when anything else runs (measured
+# on 22 threads: slowest gate call 216 ms idle and past the 2-second limit under load, against 34 ms with
+# 4 threads). The cost is about 0.7 s more per reranked search (2.6 s -> 3.3 s); 8 threads was no faster.
+LOCAL_MODEL_THREADS = 4
+
+
+def limit_local_model_threads() -> None:
+    """Cap PyTorch's CPU threads before a local model runs. Process-wide; never raises the current number."""
+    import torch  # imported here: only processes that run a local model pay for it
+
+    torch.set_num_threads(min(LOCAL_MODEL_THREADS, torch.get_num_threads()))
 
 
 class Settings(BaseSettings):

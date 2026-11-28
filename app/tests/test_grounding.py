@@ -32,6 +32,16 @@ def test_figures_are_normalised():
     assert find_figures("nothing to check here") == {}
 
 
+def test_a_hyphenated_duration_is_a_figure_like_any_other():
+    # "a 5 business-day window" was not a figure at all, so the check never compared it with the sources.
+    for written in ("a 5 business-day window", "a five-business-day window", "a 5-business-day window"):
+        assert set(find_figures(written)) == {"5 business day"}, written
+    passage = {**PREAUTH, "text": "approval window 5 business days"}
+    assert check_answer("Pre-Authorisation Requirement Matrix: a 5 business-day window.", [passage], []).grounded
+    result = check_answer("Pre-Authorisation Requirement Matrix: a 9 business-day window.", [passage], [])
+    assert not result.grounded and result.unsupported == ["9 business-day"]
+
+
 # ---- check_answer ----------------------------------------------------------------------------------
 def test_figures_from_a_cited_passage_are_grounded():
     result = check_answer("Per the Co-payment and Cost-Share Schedule, the MERIDIAN-BRONZE deductible is $3,000.",

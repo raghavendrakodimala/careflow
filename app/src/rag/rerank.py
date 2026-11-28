@@ -50,6 +50,9 @@ class CrossEncoderReranker:
             if self._model is None:
                 from sentence_transformers import CrossEncoder  # heavy (torch): only when reranking runs
 
+                from ..config import limit_local_model_threads
+
+                limit_local_model_threads()
                 options = {"max_length": self.max_length, "device": self.device, "revision": self.revision}
                 try:
                     # The local cache first: no Hub request on a warm start, and it works offline or in a

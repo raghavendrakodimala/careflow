@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from scripts.run_system_eval import load_cases
-from src.config import DATA_DIR, Settings
+from src.config import DATA_DIR, LOCAL_MODEL_THREADS, Settings, limit_local_model_threads
 from src.guard_model import MODEL_NAME, WEIGHTS, LocalClinicalClassifier, build_classifier, split_sentences
 from src.guardrails import THRESHOLD, TIME_LIMIT_S, check_input, check_rules
 
@@ -111,6 +111,20 @@ def test_allowed_prompts_are_not_blocked(real):
     # Not a hold-out: these prompts are part of the training negatives. It guards against a bad retrain.
     for message in ALLOWED_MESSAGES:
         assert check_input(message, real).blocked is False, message
+
+
+def test_local_models_cap_the_cpu_threads_and_never_raise_them():
+    torch = pytest.importorskip("torch")
+    original = torch.get_num_threads()
+    try:
+        torch.set_num_threads(LOCAL_MODEL_THREADS + 8)  # a many-core default
+        limit_local_model_threads()
+        assert torch.get_num_threads() == LOCAL_MODEL_THREADS
+        torch.set_num_threads(1)  # already lower: left alone
+        limit_local_model_threads()
+        assert torch.get_num_threads() == 1
+    finally:
+        torch.set_num_threads(original)
 
 
 def test_decisions_are_far_inside_the_time_limit(real):
