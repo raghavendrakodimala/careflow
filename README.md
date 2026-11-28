@@ -35,7 +35,7 @@ careflow/                       repository root
 │   │   ├── workflows/          the triage workflow with human review
 │   │   └── api/                the FastAPI service
 │   ├── scripts/                one demo or evaluation per milestone, run_all_checks, trace_summary
-│   ├── tests/                  1,173 offline tests
+│   ├── tests/                  1,182 offline tests
 │   ├── eval/                   six hand-written refusal cases
 │   ├── notes/                  the submission checklist
 │   └── out/                    created at run time; ignored by git (databases, index, logs, traces)
@@ -64,7 +64,7 @@ careflow/                       repository root
 
 ```
 message
-  -> input gate      rules, then a local classifier (fails closed after 2 seconds)
+  -> input gate      rules on every message; on the chat route also a local classifier (fails closed after 2 seconds)
   -> intake          the message parsed into a structured request
   -> triage rules    urgency band and route, decided in code
   -> agent team      Insurance and/or Referral Tracker, with tools and policy search
@@ -75,7 +75,7 @@ message
 - **Rules are code, not prompts.** Urgency bands, routes, referral deadlines and payment rules live in `domain/policies.py`, which uses only the standard library. The model writes replies; it does not decide routes.
 - **Layers.** Every module has a layer and may import only from lower ones. `tests/test_architecture.py` fails the build otherwise.
 - **One definition per tool.** A Pydantic model per tool gives the model's function spec, the argument validation and the MCP schema.
-- **Fail closed.** If the classifier, the intake parse or the reviewer does not answer, the message is treated as clinical and goes to staff.
+- **Fail closed.** If the classifier, the intake parse or the reviewer does not answer, the message is treated as clinical and goes to staff. If the model itself is down, triage hands the case to staff, and chat returns a 503 and raises a staff flag for the unanswered message.
 - **Nothing is invented.** A tool that fails returns an error and the case goes to staff. A policy answer the documents do not support is withheld.
 - **Booking is safe.** Bookings are atomic in SQLite, never retried, and withheld while a case waits for staff.
 
@@ -111,7 +111,7 @@ Run every command from `app/`.
 ### Offline, no key
 
 ```bash
-python -m pytest tests                          # 1,173 tests, about 4 minutes
+python -m pytest tests                          # 1,182 tests, about 2 minutes
 python -m ruff check .                          # lint
 python -m scripts.run_all_checks                # tests, data validator, routing check, fault injection
 python -m scripts.build_policy_index --local    # policy index with an offline embedder
@@ -120,7 +120,7 @@ python -m scripts.trace_summary                 # monitoring figures from out/tr
 
 On a fresh clone, expect two differences from the figures in this file:
 
-- **Four tests need the local classifier's sentence encoder** (about 90 MB, from Hugging Face). `pytest` downloads it on first use. Without it they are skipped: 611 pass and 4 are skipped. `run_all_checks` never uses the network, so it skips them until the encoder is in the cache.
+- **Four tests need the local classifier's sentence encoder** (about 90 MB, from Hugging Face). `pytest` downloads it on first use. Without it those four are skipped and the rest pass. `run_all_checks` never uses the network, so it skips them until the encoder is in the cache.
 - **Two steps of `run_all_checks` read the cached output of the M1 evaluation** (`out/intake_predictions.jsonl`): the routing check and the fault-injection run. They are reported as skipped until `run_intake_eval` has been run once, which needs a key.
 
 The live scripts also download a reranker model (about 90 MB) the first time policy search is used.
@@ -178,22 +178,27 @@ Set these in `app/.env`, in `capstone-data-toolkit/.env` or as environment varia
 
 | Check | Result |
 |---|---|
-| Offline tests | 1,173 pass |
+| Offline tests | 1,182 pass |
+| Offline checks (`run_all_checks`) | 4 of 4: tests, data validator, routing check, fault injection |
+| M1 intake, 197 labelled records, live | Specialty 97%, clinical-advice flag 99.5%, urgency band 69.5% exact and 195 of 197 within one band; 1 urgent case scored non-urgent |
 | M4 retrieval, PDF corpus | 17 of 17 questions with the right document in the top 4; no false abstentions and no false answers at the chosen threshold |
-| M5 routing, 200 intake records, offline | Same route as the labels on 191 of 197; no clinical message missed |
+| M5 routing, 200 intake records, offline | Same route as the labels on 189 of 197; no clinical message missed |
 | M5 demo, live | 6 of 6 checks |
 | M6 demo, live | 6 of 6 checks, including a booking over MCP |
-| M8 golden set, live | 19 of 20 |
+| M7 fault injection, offline | All checks hold: with the EHR or the model down, nothing is handled automatically and nothing is booked |
+| M8 golden set, live | 16 of 20 in one full run; the 3 failures other than EV-020 were provider errors and passed on rerun |
 | M8 extra refusal cases, live | 6 of 6 |
 
-The live M5, M6 and M8 figures are from `gemini-flash-lite-latest` on 24 November 2026. Each is a single run, and the `-latest` model names move over time.
+The live figures are from `gemini-flash-lite-latest` on 28 November 2026, on the final code. In the full golden-set run, three cases failed because the free-tier provider did not answer: two safety reviews and one agent call, each recorded as an error in the traces and each failing safely (the patient got the script or an error, never an invented answer). Those three passed when rerun, so every golden case except EV-020 has passed on the final code. Model output varies between runs, and the `-latest` model names move over time. On 24 November, before the last fixes, a run scored 19 of 20.
+
+**Fixes from the 28 November verification.** The intake prompt now applies the SOP's "upgrade on doubt" rule (urgent cases scored non-urgent: 5 to 1, at the cost of 25 non-urgent cases sent to staff as Urgent). The safety reviewer has its own time limit, so a provider outage fails closed in seconds instead of three minutes, and its outages are traced as errors. The groundedness check now recognises hyphenated durations such as "5 business-day". The local models are capped at 4 CPU threads, which keeps the input gate far inside its 2-second limit under load.
 
 ## Engineering practices
 
 - **Configuration, not code changes.** The model, fallbacks, classifier, thresholds, retries, breaker and tracing are settings, validated at start-up.
 - **Resilience.** Tool calls are retried with exponential backoff only when the tool is safe to repeat; a booking never is. Each backend and the model has a circuit breaker. When something is down the case goes to staff with a clear note.
 - **Observability.** Every request writes a trace with a span per step, tool call and model call (model, latency, tokens), without the patient's text. `scripts/trace_summary` turns the trace file into request, latency, error and token figures. Failures the API handles are logged.
-- **Quality gates.** Lint (ruff) and 1,173 offline tests run in CI on every pull request. The tests need no key or network.
+- **Quality gates.** Lint (ruff) and 1,182 offline tests run in CI on every pull request. The tests need no key or network.
 - **Dependencies** are bounded to the tested major versions; development tools are kept apart from the runtime set.
 - **Secrets** come only from the environment or an ignored `.env` file. Nothing in the repository or its history holds a key.
 
@@ -203,10 +208,14 @@ A container image and deployment pipeline; authentication per user and rate limi
 
 ## Known limits
 
-- **The golden set cannot score above 19 of 20.** Case EV-020, an unanswerable question about parking, is labelled `refuse`. The hand-written case of the same kind expects `human_review`, which is what the system does for both. In this system `refuse` means the clinical script, and the scorer fails that too, because the script states a callback time.
-- **The local classifier is cautious.** It blocks about 40 of 147 ordinary messages that mention symptoms. This was chosen: a less cautious setting missed more real clinical questions. It guards the chat path only.
-- **Negation is minimal.** "No fever or chest pain" still gets the emergency statement.
-- **Free-tier limits.** Google's free tier allows `gemini-flash-latest` 20 requests a day, so the lite model is the default.
+- **The golden set cannot score above 19 of 20.** Case EV-020, an unanswerable question about parking, is labelled `refuse`. Case EV-905 in the same set, an unanswerable question of the same kind, expects `human_review`, which is what the system does for both. In this system `refuse` means the clinical script, and the scorer fails that too, because the script states a callback time.
+- **The local classifier is cautious.** It blocks some ordinary administrative messages. This was chosen: a less cautious threshold missed more real clinical questions. `scripts/train_guard_classifier.py` prints the current rates. It guards the chat path only; the triage path uses the rules and the intake parse.
+- **Negation is minimal.** Only a negation directly before an emergency phrase is recognised, so "no fever or chest pain" still gets the emergency statement.
+- **Groundedness covers figures and citations.** A paraphrased claim with no amount, percentage, duration or code in it is not checked.
+- **Free-tier limits.** Google's free tier allows `gemini-flash-latest` 20 requests a day, so the lite model is the default. Under heavy use the free tier rate-limits; on 28 November about one case in ten hit a provider error.
+- **A stalled provider is slow to hand over.** The safety reviewer has a short time limit, but the agents' own model calls use the general one, so when the provider stalls a case can wait about 3 minutes before it is handed to staff.
+- **Urgency over-triage.** The intake prompt raises doubtful cases to the higher band, as the SOP asks, so about 25 of 197 non-urgent messages go to staff as Urgent.
+- **Policy search is slower on CPU.** With the local models capped at 4 threads, a reranked search takes about 3.3 seconds.
 - **LangFuse export** is tested against a fake client only.
 - **Not production ready.** The API has no rate limiting, per-user login or container image. The classifier threshold has no clinical sign-off, which the clinic's own policy requires.
 - **The golden set influenced three fixes,** so it is not a clean test for those kinds of question.

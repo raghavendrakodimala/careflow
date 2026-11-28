@@ -46,6 +46,7 @@ from ..agents import (
     Reviewer,
     TeamResult,
     build_default_reviewer,
+    record_verdict,
     review_reply,
     run_specialists,
     withhold,
@@ -392,7 +393,7 @@ def build_triage_graph(dependencies: TriageDependencies, checkpointer: Any = Non
             return {}  # nothing was written by the team
         with dependencies.agent.tracer.open_span(REVIEWER_SPAN, kind=SpanKind.GUARDRAIL, agent=REVIEWER.name) as span:
             verdict = review_reply(state["record"]["raw_text"], state.get("response") or "", dependencies.review)
-            span.set(safe=verdict.safe, category=verdict.category)
+            record_verdict(span, verdict)
         if verdict.safe:
             return {"verdict": verdict.model_dump(), "audit": make_audit_entry(TriageNode.SAFETY_REVIEW, safe=True)}
         ticket = withhold(dependencies.agent, state.get("patient_ref"), _get_thread_id(config), urgency=state["band"],

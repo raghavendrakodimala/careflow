@@ -28,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import GuardClassifierMode, Settings, get_settings
+from .config import GuardClassifierMode, Settings, get_settings, limit_local_model_threads
 from .guardrails import THRESHOLD, Classifier, ClinicalRisk, GuardCategory, build_hosted_classifier
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # default; _load() takes the name stored with the weights
@@ -79,6 +79,7 @@ class LocalClinicalClassifier:
             if self._encoder is None:
                 from sentence_transformers import SentenceTransformer
 
+                limit_local_model_threads()  # keeps the gate well inside its 2-second limit under load
                 try:  # the cache first: no network call on the request path
                     model = SentenceTransformer(self.model_name, device="cpu", local_files_only=True)
                 except Exception:

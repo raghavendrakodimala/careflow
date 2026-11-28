@@ -29,7 +29,7 @@ Source: email from the program team (pasted 2026-11-15). Edit this file as items
 - Do not commit `.env` or `data/` (toolkit ground rule). If the repo is public, check no API key is in any file or history.
 - Current `app` reads the data and key from `../capstone-data-toolkit/` via paths relative to the file (not absolute), but it still expects the toolkit's `.env` and generated `data/` to exist. **Done:** the data is committed, and the root `README.md` gives setup and run instructions (2026-11-23).
 - Dates differ: the project brief says final presentations are 15-16 August, but this email's deadline is 25 Nov 2026. Treat the email as current; confirm with the program team if unsure.
-- Milestone status (2026-11-23): M1 to M8 are built and merged into `main` (pull requests up to 8). 1,173 offline tests pass; live results are in the root `README.md`.
+- Milestone status (2026-11-23): M1 to M8 are built and merged into `main` (pull requests up to 8). 1,182 offline tests pass; live results are in the root `README.md`.
 
 ## Remaining before submission (2026-11-23)
 - [ ] Merge the README branch (`docs/krp-readme`) into `main`.

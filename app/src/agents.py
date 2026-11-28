@@ -29,7 +29,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .agent import DEFAULT_THREAD, AgentResult, PatientMismatchError, get_thread_patient, redact_answers, run_agent
-from .config import Settings
+from .config import Settings, get_settings
 from .domain import policies
 from .domain.policies import Route, UrgencyBand
 from .graph import AgentDependencies
@@ -41,7 +41,7 @@ from .prompts import DEFLECTION_SCRIPT, INSURANCE_PROMPT, REFERRAL_PROMPT, REVIE
 from .schemas import DEFAULT_CHANNEL
 from .state import Role
 from .store import FlagCategory
-from .telemetry import AGENT_SPAN_PREFIX, INPUT_GUARD_SPAN, REVIEWER_SPAN, SpanKind
+from .telemetry import AGENT_SPAN_PREFIX, INPUT_GUARD_SPAN, REVIEWER_SPAN, SpanKind, SpanStatus
 from .tool_contracts import CONTACT_ID, ToolName
 
 # Staff-flag reasons for the Clinical Routing Tickets the team raises itself.
@@ -124,10 +124,25 @@ class SafetyVerdict(BaseModel):
 
 
 Reviewer = Callable[[str, str], SafetyVerdict]  # (patient message, draft reply) -> verdict
+# Seconds one reviewer request may take before it counts as failed (and so as a veto).
+REVIEWER_TIMEOUT_S = 15
+# Retries per model for the reviewer. One: with none, a single rate-limit error vetoed a correct reply
+# (3 golden cases in one live run); the general three retries took 184 s to fail during an outage.
+REVIEWER_RETRIES = 1
+# How a verdict that could not be obtained starts its reason, so it can be told apart from a clinical veto.
+REVIEWER_UNAVAILABLE = "reviewer unavailable"
 
 
 def build_default_reviewer(settings: Settings | None = None) -> Reviewer:
-    """The model-backed reviewer: one structured-output call per reply, with REVIEWER_PROMPT."""
+    """The model-backed reviewer: one structured-output call per reply, with REVIEWER_PROMPT.
+
+    The call has its own limits. A review that fails is a veto (OP-CS-014 9.3), so during a provider outage
+    the patient gets the script either way; with the general limits (a 90-second timeout and three retries)
+    they waited minutes for it. One retry rides out a passing rate-limit error, and the fallback models are
+    kept: a second model can still give a verdict.
+    """
+    settings = (settings or get_settings()).model_copy(
+        update={"request_timeout_s": REVIEWER_TIMEOUT_S, "transport_retries": REVIEWER_RETRIES})
 
     def review(message: str, reply: str) -> SafetyVerdict:
         messages = [
@@ -152,7 +167,16 @@ def review_reply(message: str, reply: str, reviewer: Reviewer | None) -> SafetyV
         return reviewer(message, reply)
     except Exception as error:
         return SafetyVerdict(safe=False, category=SafetyCategory.OTHER_CLINICAL.value,
-                             reason=f"reviewer unavailable ({type(error).__name__})")
+                             reason=f"{REVIEWER_UNAVAILABLE} ({type(error).__name__})")
+
+
+def record_verdict(span, verdict: SafetyVerdict) -> None:
+    """Record a verdict on the reviewer's span. A review that could not be done is recorded as an error
+    with the failure's type, so the traces tell an outage from a clinical veto (both still withhold the reply)."""
+    span.set(safe=verdict.safe, category=verdict.category)
+    if verdict.reason.startswith(REVIEWER_UNAVAILABLE):
+        span.status = SpanStatus.ERROR.value
+        span.set(error_type=verdict.reason[len(REVIEWER_UNAVAILABLE):].strip(" ()") or "unknown")
 
 
 def _raise_clinical_ticket(dependencies: AgentDependencies, patient_ref: str | None, contact_id: str | None, reason: str, urgency: str,
@@ -330,7 +354,7 @@ def run_team(message: str, dependencies: AgentDependencies, reviewer: Reviewer |
         team = run_specialists(message, dependencies, patient_ref, channel, thread_id, withheld, checkpointer)
         with dependencies.tracer.open_span(REVIEWER_SPAN, kind=SpanKind.GUARDRAIL, agent=REVIEWER.name) as span:
             verdict = review_reply(message, team.answer, reviewer)
-            span.set(safe=verdict.safe, category=verdict.category)
+            record_verdict(span, verdict)
         team.verdict = verdict.model_dump()
         if not verdict.safe:
             flag = withhold(dependencies, team.patient_ref, thread_id, message=message, channel=channel)

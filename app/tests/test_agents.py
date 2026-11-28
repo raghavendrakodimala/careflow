@@ -2,22 +2,29 @@
 
 import pytest
 
+import src.agents as agents_module
 from src.agents import (
     INSURANCE,
     INTAKE,
     REFERRAL,
     REVIEW_TICKET_REASON,
     REVIEWER,
+    REVIEWER_RETRIES,
+    REVIEWER_TIMEOUT_S,
     TEAM,
     SafetyVerdict,
+    build_default_reviewer,
     list_specialists_for,
     review_reply,
     run_specialists,
     run_team,
 )
+from src.config import get_settings
 from src.graph import AgentDependencies
+from src.llm_client import LLMClientError
 from src.memory import PatientMemory
 from src.prompts import DEFLECTION_SCRIPT, INSURANCE_PROMPT, REFERRAL_PROMPT, SYSTEM_PROMPT
+from src.telemetry import REVIEWER_SPAN, MemorySink, Tracer
 from src.tool_contracts import TOOLS_BY_NAME
 from src.tools import CareFlowTools
 
@@ -130,6 +137,53 @@ def test_reviewer_failure_fails_closed():
 
     verdict = review_reply("q", "Your co-pay is $40.", raise_timeout)
     assert verdict.safe is False and "unavailable" in verdict.reason
+
+
+def test_the_reviewer_call_has_its_own_short_limits(monkeypatch):
+    seen = {}
+
+    def fake_complete(messages, schema, settings, **options):
+        seen["timeout"], seen["retries"] = settings.request_timeout_s, settings.transport_retries
+        seen["fallbacks"] = settings.careflow_fallback_models
+        return SAFE
+
+    monkeypatch.setattr(agents_module, "complete_structured", fake_complete)
+    settings = get_settings().model_copy(update={"request_timeout_s": 90, "transport_retries": 3,
+                                                 "careflow_fallback_models": "gemini/second"})
+    build_default_reviewer(settings)("Is my plan active?", "Your plan is active.")
+    # A failed review is a veto either way (OP-CS-014 9.3): during an outage it must fail fast, not after minutes.
+    assert seen == {"timeout": REVIEWER_TIMEOUT_S, "retries": REVIEWER_RETRIES, "fallbacks": "gemini/second"}
+    assert REVIEWER_RETRIES == 1  # none turned a single rate-limit error into a veto
+    assert settings.request_timeout_s == 90  # the caller's settings are not changed
+
+
+def _run_team_with_trace(reviewer):
+    sink = MemorySink()
+    team = Team(steps=[_make_message("Your co-pay is $40.")])
+    team.dependencies.tracer = Tracer([sink])
+    result = run_team("What is my co-pay?", team.dependencies, reviewer=reviewer)
+    (span,) = [span for span in sink.spans if span["name"] == REVIEWER_SPAN]
+    return result, span
+
+
+def test_an_unavailable_reviewer_is_a_veto_recorded_as_an_error():
+    def raise_provider_error(message, reply):
+        raise LLMClientError("all models failed")
+
+    result, span = _run_team_with_trace(raise_provider_error)
+    assert result.vetoed and result.answer == DEFLECTION_SCRIPT  # still fails closed
+    assert (span["status"], span["error_type"], span["safe"]) == ("error", "LLMClientError", False)
+
+
+def test_a_clinical_veto_is_recorded_as_a_veto_not_an_error():
+    result, span = _run_team_with_trace(lambda message, reply: VETO)
+    assert result.vetoed
+    assert (span["status"], span["category"], span["safe"]) == ("ok", "medication", False) and "error_type" not in span
+
+
+def test_the_insurance_role_asks_for_both_parts_of_a_coverage_question():
+    assert "whether pre-authorisation is needed" in INSURANCE_PROMPT and "what the patient pays" in INSURANCE_PROMPT
+    assert "what the patient pays" not in REFERRAL_PROMPT
 
 
 def test_reviewer_sees_the_message_and_the_draft():

@@ -110,7 +110,8 @@ def main() -> None:
             problems.append("the assistant was run on an Urgent case")
         if ToolName.BOOK_APPOINTMENT in (result.agent.get("tools_offered") or []):
             problems.append("booking was offered before the review")
-        if demo.tools.booked:
+        # Only this patient's bookings count: the automatic case above may have booked for its own patient.
+        if patients["urgent"] in demo.tools.booked.values():
             problems.append(f"booked before the review: {demo.tools.booked}")
         demo.record_check("urgent: paused, nothing booked", problems)
 
@@ -133,7 +134,7 @@ def main() -> None:
         problems = [] if (result.route, result.status) == (Route.HUMAN_REVIEW, CaseStatus.AWAITING_HUMAN_REVIEW) else [f"route {result.route}, status {result.status}"]
         if not any("sign-off" in reason for reason in result.reasons):
             problems.append(f"reasons {result.reasons}")
-        if demo.tools.booked:
+        if patients["sign_off"] in demo.tools.booked.values():
             problems.append("booked without sign-off")
         demo.record_check("sign-off: held for staff", problems)
 
