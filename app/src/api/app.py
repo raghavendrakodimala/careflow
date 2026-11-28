@@ -41,7 +41,7 @@ from ..guardrails import Classifier
 from ..schemas import DEFAULT_CHANNEL, Channel
 from ..state import build_thread_config
 from ..store import RuntimeStore
-from ..tool_contracts import ToolName
+from ..tool_contracts import CONTACT_ID, ToolName
 from ..tools import CareFlowTools
 from ..workflows import (
     AlreadyTriagedError,
@@ -61,6 +61,27 @@ CHAT_PREFIX = "chat:"
 # The 503 detail when the chat path fails (the model or a dependency is down).
 UNAVAILABLE = ("The assistant cannot answer right now. Your message has not been lost; please try again shortly or "
                "call the clinic.")
+# The staff flag raised when a chat turn fails. It names the kind of failure and nothing from the request.
+UNANSWERED_REASON = "The assistant could not answer a chat message ({error}); the patient was asked to try again or call."
+
+
+def _flag_unanswered_chat(tools: Any, thread_id: str, patient_ref: str | None, error: Exception) -> None:
+    """Tell staff that a chat message went unanswered, so a failed turn is a handoff and not only an error.
+
+    One flag per conversation and kind of failure (the store de-duplicates within a contact), so a caller
+    who retries does not fill the queue. Best effort: if the flag cannot be raised the 503 still goes out,
+    and only the type of the second failure is logged.
+    """
+    reason = UNANSWERED_REASON.format(error=type(error).__name__)
+    context = {CONTACT_ID: CHAT_PREFIX + thread_id}
+    try:
+        result = tools.call(ToolName.FLAG_FOR_HUMAN.value, {"reason": reason, "patient_ref": patient_ref}, context=context)
+        if not result.get("ok") and patient_ref:  # an unknown reference must not stop the handoff
+            tools.call(ToolName.FLAG_FOR_HUMAN.value, {"reason": reason}, context=context)
+    except Exception as flag_error:
+        log.error("staff flag for failed chat on thread %s was not raised: %s", thread_id, type(flag_error).__name__)
+
+
 # Request limits. A thread_id becomes a checkpoint key, so its characters are restricted.
 MAX_MESSAGE_CHARS = 8000
 MAX_THREAD_ID_CHARS = 64
@@ -291,6 +312,7 @@ def create_app(resources: Resources | None = None) -> FastAPI:
             # Logged with the thread and the error's type only. The error's own text and traceback are left
             # out: a provider error can quote the request, which holds the message and the patient (data handling).
             log.error("chat failed on thread %s: %s", thread_id, type(error).__name__)
+            _flag_unanswered_chat(held_resources.dependencies.agent.tools, thread_id, body.patient_ref, error)
             raise HTTPException(status_code=503, detail=UNAVAILABLE) from error
         # The caller's own thread_id is returned, without the internal chat prefix.
         return {"thread_id": thread_id, "answer": team.answer, "route": team.route, "agents": team.agents,

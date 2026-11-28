@@ -744,6 +744,50 @@ def test_a_model_failure_in_chat_is_a_503_with_the_fixed_wording_and_the_thread_
     assert retried.status_code == 200 and retried.json()["answer"] == "Here is what I found."
 
 
+def _fail_model(harness: Harness) -> None:
+    harness.dependencies.agent.model = lambda messages, specs: (_ for _ in ()).throw(RuntimeError("provider down"))
+
+
+def _list_unanswered_flags(harness: Harness) -> list[dict]:
+    return [flag for flag in harness.tools.store.list_flags() if "could not answer a chat message" in flag["reason"]]
+
+
+def test_a_failed_chat_turn_raises_one_staff_flag_however_often_the_caller_retries():
+    harness = Harness()
+    ref = _find_patient(harness.tools)
+    _fail_model(harness)
+    with _open_client(harness) as client:
+        for _ in range(3):
+            failed = client.post("/v1/chat", json={"message": "Is my plan active?", "patient_ref": ref, "thread_id": "t-flag"})
+            assert failed.status_code == 503 and failed.json() == {"detail": UNAVAILABLE}
+        client.post("/v1/chat", json={"message": "Is my plan active?", "patient_ref": ref, "thread_id": "t-other"})
+    flags = _list_unanswered_flags(harness)
+    assert len(flags) == 2  # one per conversation, not one per attempt
+    assert all(flag["patient_ref"] == ref and "RuntimeError" in flag["reason"] for flag in flags)
+    assert all("Is my plan active" not in flag["reason"] and "provider down" not in flag["reason"] for flag in flags)
+
+
+def test_a_failed_chat_turn_with_an_unknown_patient_reference_still_reaches_staff():
+    harness = Harness()
+    _fail_model(harness)
+    with _open_client(harness) as client:
+        failed = client.post("/v1/chat", json={"message": "Is my plan active?", "patient_ref": "MHP-P-99999", "thread_id": "t-unknown"})
+    assert failed.status_code == 503
+    (flag,) = _list_unanswered_flags(harness)
+    assert flag["patient_ref"] is None
+
+
+def test_a_staff_flag_that_cannot_be_raised_does_not_change_the_503(caplog):
+    harness = Harness()
+    _fail_model(harness)
+    harness.tools.call = lambda *arguments, **options: (_ for _ in ()).throw(sqlite3.OperationalError("disk full"))
+    with caplog.at_level(logging.ERROR), _open_client(harness) as client:
+        failed = client.post("/v1/chat", json={"message": "Is my plan active?", "thread_id": "t-store-down"})
+    assert failed.status_code == 503 and failed.json() == {"detail": UNAVAILABLE}
+    assert "staff flag for failed chat on thread t-store-down was not raised: OperationalError" in caplog.text
+    assert "disk full" not in caplog.text
+
+
 # ---- logging privacy ----------------------------------------------------------------------------------------
 SECRET_TEXT = "My member number is MER64867187 and I was born on 4 March 1961."
 
